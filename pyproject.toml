@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "in-hand-rotation-mjlab"
+version = "0.1.0"
+description = "In-hand cube rotation task using LEAP hand in MuJoCo with mjlab"
+requires-python = ">=3.10"
+dependencies = [
+  "mjlab",
+  "pyzmq>=25",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+# mjlab is a git submodule - run 'git submodule update --init' first
+mjlab = { path = "third_party/mjlab", editable = true }
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

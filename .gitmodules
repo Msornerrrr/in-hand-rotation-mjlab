@@ -1,0 +1,3 @@
+[submodule "third_party/mjlab"]
+	path = third_party/mjlab
+	url = git@github.com:Msornerrrr/mjlab.git
