@@ -1,0 +1,18 @@
+services:
+  policy-runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: in-hand-rotation-real-world:noetic
+    network_mode: host
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      - ROS_MASTER_URI
+      - ROS_HOSTNAME
+      - ROS_IP
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ..:/workspace/in-hand-rotation-mjlab
+    working_dir: /workspace/in-hand-rotation-mjlab
+    stdin_open: true
+    tty: true
