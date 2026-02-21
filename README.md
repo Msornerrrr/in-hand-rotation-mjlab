@@ -51,9 +51,6 @@ Clone this repository and run:
 ```bash
 cd ~/projects/in-hand-rotation-mjlab
 
-# Initialize git submodules (mjlab framework)
-git submodule update --init --recursive
-
 # Install dependencies
 uv sync
 ```
@@ -198,8 +195,7 @@ in_hand_rotation_mjlab/
 │   ├── robots/leap_hand/         # Robot models & assets
 │   ├── sim2sim/                  # Deployment testing infrastructure
 │   └── policy_server/            # ZMQ inference server for hardware
-├── scripts/                      # Training, evaluation, and deployment scripts
-└── third_party/mjlab/            # RL framework (git submodule pointer; source not vendored)
+└── scripts/                      # Training, evaluation, and deployment scripts
 ```
 
 ---

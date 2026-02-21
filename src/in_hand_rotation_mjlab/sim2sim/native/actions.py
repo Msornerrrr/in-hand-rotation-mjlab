@@ -9,13 +9,13 @@ from mjlab.actuator import DelayedActuatorCfg, IdealPdActuatorCfg
 from mjlab.envs.mdp.actions import (
   JointEffortActionCfg,
   JointPositionActionCfg,
-  JointPositionDeltaActionCfg,
   JointVelocityActionCfg,
 )
 from mjlab.utils.lab_api.string import resolve_matching_names, resolve_matching_names_values
 
 from in_hand_rotation_mjlab.policy_server.contracts import ActionTermMetadata
 from in_hand_rotation_mjlab.sim2sim.native.state import _NativeState
+from in_hand_rotation_mjlab.tasks.hand_cube.mdp.actions import JointPositionDeltaActionCfg
 
 
 class _ActionTerm(Protocol):

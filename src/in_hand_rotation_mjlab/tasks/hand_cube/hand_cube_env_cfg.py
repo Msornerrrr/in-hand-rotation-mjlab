@@ -1,6 +1,5 @@
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
-from mjlab.envs.mdp.actions import JointPositionDeltaActionCfg
 from mjlab.managers.action_manager import ActionTermCfg
 from mjlab.managers.command_manager import CommandTermCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
@@ -16,6 +15,8 @@ from mjlab.terrains import TerrainImporterCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 from in_hand_rotation_mjlab.tasks.hand_cube import mdp as hand_cube_mdp
+from in_hand_rotation_mjlab.tasks.hand_cube.mdp.actions import JointPositionDeltaActionCfg
+
 
 # Actor observation delay randomization (in env/control steps).
 # Light randomization between 0 and 1 step.

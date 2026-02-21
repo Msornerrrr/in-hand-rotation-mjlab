@@ -7,11 +7,11 @@ import torch
 
 from mjlab.envs.mdp.actions import (
   JointPositionActionCfg,
-  JointPositionDeltaActionCfg,
 )
 from mjlab.utils.lab_api.string import resolve_matching_names_values
 
 from in_hand_rotation_mjlab.policy_server.contracts import ActionTermMetadata, ServerActionPacket
+from in_hand_rotation_mjlab.tasks.hand_cube.mdp.actions import JointPositionDeltaActionCfg
 
 
 @dataclass

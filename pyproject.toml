@@ -16,8 +16,7 @@ dependencies = [
 package = true
 
 [tool.uv.sources]
-# mjlab is a git submodule - run 'git submodule update --init' first
-mjlab = { path = "third_party/mjlab", editable = true }
+mjlab = { git = "https://github.com/mujocolab/mjlab" }
 
 [tool.setuptools]
 package-dir = {"" = "src"}
