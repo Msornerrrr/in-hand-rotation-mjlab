@@ -22,10 +22,7 @@ This repository contains Reinforcement Learning (RL) environments for in-hand cu
 
 The videos above show a trained policy rotating a cube in simulation (left) and on the real LEAP hand (right). The policy is trained using domain randomization and asymmetric actor-critic to enable robust sim-to-real transfer.
 
-**Full deployment demo + failure cases:**
- <!-- [YouTube video](https://www.youtube.com/watch?v=5JPbPGIz82w) -->
-
-[![Full deployment demo and failure cases](https://img.youtube.com/vi/5JPbPGIz82w/hqdefault.jpg)](https://www.youtube.com/watch?v=5JPbPGIz82w)
+**Full deployment demo + failure cases:** [YouTube video](https://www.youtube.com/watch?v=5JPbPGIz82w)
 
 ---
 
