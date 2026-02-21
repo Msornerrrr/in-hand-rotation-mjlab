@@ -66,6 +66,10 @@ uv sync
 
 ---
 
+**Real-world setup:** see [`real_world/README.md`](real_world/README.md) for the Docker-based ROS runtime, deployment client, and sys-id collection commands.
+
+---
+
 ## Using a Pre-Trained Agent
 
 You can use a pre-trained agent directly in the MjLab environment to see the cube rotation behavior:
@@ -73,6 +77,17 @@ You can use a pre-trained agent directly in the MjLab environment to see the cub
 ```bash
 uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate \
   --checkpoint-file logs/rsl_rl/<experiment_name>/<timestamp>/model_*.pt
+```
+
+This repo also includes a sample checkpoint:
+
+- `ckpts/leap_left_custom_model_4900.pt` (task: `Mjlab-Leap-Left-Custom-HandCube-Rotate`)
+
+Example:
+
+```bash
+uv run python scripts/play.py Mjlab-Leap-Left-Custom-HandCube-Rotate \
+  --checkpoint-file ckpts/leap_left_custom_model_4900.pt
 ```
 
 To test the environment with random actions before training:
@@ -131,6 +146,8 @@ uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate \
 ## Deploying to Real Hardware
 
 For hardware deployment, we provide a ZMQ-based policy server that runs inference and communicates with the physical LEAP hand controller.
+
+For real hardware runtime/container setup, command launch, and system identification collection, see [`real_world/README.md`](real_world/README.md).
 
 Start the policy server:
 
@@ -208,10 +225,12 @@ in_hand_rotation_mjlab/
 - ✅ Sim2sim deployment testing
 - ✅ Policy server infrastructure for hardware deployment
 - ✅ System identification tools
+- ✅ Example Checkpoints
+- ✅ Real-world deployment code - Hardware interface code for LEAP hand
+- ✅ Hardware setup guide - Detailed instructions for physical LEAP hand
 
 **Planned Releases:**
-- 🔄 **Real-world deployment code** - Hardware interface code for LEAP hand control
-- 🔄 **Hardware setup guide** - Detailed instructions for physical LEAP hand setup
+- 🔄 **TBD** - Maybe try rotation along all axis 🤔
 
 ---
 
