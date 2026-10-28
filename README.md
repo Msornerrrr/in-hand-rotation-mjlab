@@ -37,7 +37,7 @@ Wall-clock times are on one RTX 4090.
 | PPO | 0.261 | 0.344 rad/s | 7.4 h | 393M |
 | World model | **0.292** | 0.335 rad/s | 2.5 h | 102M |
 
-The world-model policy passed PPO's *final* score after **25 minutes and 18M env steps**. PPO needed 6.5 hours and 262M steps to get there, so the world model was about 15× faster on both counts. Both policies read only the hand's joints and drop no cubes.
+The world-model policy reached PPO's level (≈0.26 reward/s) after **25 minutes and 18M env steps**, where PPO needed 6.5 hours and 262M steps: about **15× faster** in both wall clock and samples. It passed PPO's final score at 30 minutes. Both policies read only the hand's joints and drop no cubes.
 
 **Palm-down fingertip rotation, 22 objects.** Evaluated at 64 rollouts per object, 60 s each, with pad friction (0.25–1.2), object mass and the servo randomized. "Rewarded yaw" is the rotation the task pays for, capped at 0.3 rad/s, out of a maximum of 1031°/60 s. "Dropped" means the object moved more than 30 mm from where it started.
 
