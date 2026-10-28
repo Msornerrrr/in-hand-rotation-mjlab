@@ -1,24 +1,23 @@
-"""Script to list mjlab environments."""
+"""List this repository's tasks (``--keyword`` filters; ``--all`` also lists mjlab's built-in tasks)."""
 
 import tyro
 from prettytable import PrettyTable
 
-import mjlab.tasks  # noqa: F401
 import in_hand_rotation_mjlab.tasks  # noqa: F401
 from mjlab.tasks.registry import list_tasks
 
 
-def list_environments(keyword: str | None = None):
+def list_environments(keyword: str | None = None, all: bool = False):
   """List all registered environments.
 
   Args:
     keyword: Optional filter to only show environments containing this keyword.
   """
   table = PrettyTable(["#", "Task ID"])
-  table.title = "Available Environments in mjlab"
+  table.title = "In-hand rotation tasks"
   table.align["Task ID"] = "l"
 
-  all_tasks = list_tasks()
+  all_tasks = [t for t in list_tasks() if all or t.startswith("Mjlab-Leap")]
   idx = 0
   for task_id in all_tasks:
     try:

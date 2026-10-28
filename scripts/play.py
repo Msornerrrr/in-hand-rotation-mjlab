@@ -1,4 +1,11 @@
-"""Script to play RL agent with RSL-RL."""
+"""Play a PPO checkpoint (or a zero / random agent) in a task's play env, in the native viewer, a viser web viewer, or to
+an mp4.
+
+  uv run python scripts/play.py Mjlab-Leap-Left-Custom-HandCube-Rotate-Gear --checkpoint-file ckpts/yaw/ppo_gear_yaw.pt
+  MUJOCO_GL=egl uv run python scripts/play.py <task> --checkpoint-file <ckpt> --num-envs 1 --video True --viewer none
+
+World-model actors (``actor_*.pt``) use their own observation adapters: see scripts/render/ and scripts/eval/.
+"""
 
 import os
 import sys
@@ -6,6 +13,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
+import mujoco
+import numpy as np
 import torch
 import tyro
 from rsl_rl.runners import OnPolicyRunner
@@ -13,8 +22,7 @@ from rsl_rl.runners import OnPolicyRunner
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
-from mjlab.tasks.tracking.mdp import MotionCommandCfg
-from mjlab.utils.os import get_wandb_checkpoint_path
+from in_hand_rotation_mjlab.utils.plant import check_checkpoint_plant
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
@@ -22,11 +30,8 @@ from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
 @dataclass(frozen=True)
 class PlayConfig:
-  agent: Literal["zero", "random", "teleop", "trained"] = "trained"
-  registry_name: str | None = None
-  wandb_run_path: str | None = None
+  agent: Literal["zero", "random", "trained"] = "trained"
   checkpoint_file: str | None = None
-  motion_file: str | None = None
   num_envs: int | None = None
   device: str | None = None
   video: bool = False
@@ -34,10 +39,62 @@ class PlayConfig:
   video_height: int | None = None
   video_width: int | None = None
   camera: int | str | None = None
-  viewer: Literal["auto", "native", "viser"] = "auto"
+  viewer: Literal["auto", "native", "viser", "none"] = "auto"
+  """"none": no viewer; with --video True, record the clip and exit (headless machines)."""
 
-  # Internal flag used by demo script.
-  _demo_mode: tyro.conf.Suppress[bool] = False
+
+class TaskCenteredViserPlayViewer(ViserPlayViewer):
+  """Viser viewer that honors the task viewer body as its tracked center."""
+
+  def setup(self) -> None:
+    super().setup()
+    self._center_on_viewer_body()
+
+  def _center_on_viewer_body(self) -> None:
+    viewer_cfg = self.cfg
+    scene = getattr(self, "_scene", None)
+    server = getattr(self, "_server", None)
+    if scene is None or server is None:
+      return
+
+    body_id = -1
+    if getattr(viewer_cfg, "entity_name", None) and getattr(viewer_cfg, "body_name", None):
+      model_body_name = f"{viewer_cfg.entity_name}/{viewer_cfg.body_name}"
+      body_id = mujoco.mj_name2id(
+        scene.mj_model, mujoco.mjtObj.mjOBJ_BODY, model_body_name
+      )
+      if body_id < 0:
+        body_id = mujoco.mj_name2id(
+          scene.mj_model, mujoco.mjtObj.mjOBJ_BODY, viewer_cfg.body_name
+        )
+
+    if body_id >= 0:
+      scene._tracked_body_id = body_id
+      scene.request_update()
+
+    azimuth = np.deg2rad(float(viewer_cfg.azimuth))
+    elevation = np.deg2rad(float(viewer_cfg.elevation))
+    distance = float(viewer_cfg.distance)
+    camera_offset = np.array(
+      [
+        -np.cos(elevation) * np.cos(azimuth),
+        -np.cos(elevation) * np.sin(azimuth),
+        # ViewerConfig follows MuJoCo's convention: negative elevation means
+        # above the look-at point. Viser uses an explicit Cartesian offset.
+        -np.sin(elevation),
+      ]
+    ) * distance
+
+    def apply_camera(client) -> None:
+      client.camera.position = camera_offset
+      client.camera.look_at = np.zeros(3)
+
+    for client in server.get_clients().values():
+      apply_camera(client)
+
+    @server.on_client_connect
+    def _(client) -> None:
+      apply_camera(client)
 
 
 def _prepare_agent_cfg(agent_cfg) -> dict:
@@ -46,8 +103,13 @@ def _prepare_agent_cfg(agent_cfg) -> dict:
   for model_key in ("actor", "critic"):
     model_cfg = cfg_dict.get(model_key)
     if isinstance(model_cfg, dict):
-      if model_cfg.get("class_name", "MLPModel") != "CNNModel":
+      class_name = model_cfg.get("class_name", "MLPModel")
+      if class_name != "CNNModel":
         model_cfg.pop("cnn_cfg", None)
+      if class_name != "RNNModel":
+        model_cfg.pop("rnn_type", None)
+        model_cfg.pop("rnn_hidden_dim", None)
+        model_cfg.pop("rnn_num_layers", None)
   return cfg_dict
 
 
@@ -58,90 +120,22 @@ def run_play(task_id: str, cfg: PlayConfig):
 
   env_cfg = load_env_cfg(task_id, play=True)
   agent_cfg = load_rl_cfg(task_id)
-
-  DUMMY_MODE = cfg.agent in {"zero", "random", "teleop"}
+  DUMMY_MODE = cfg.agent in {"zero", "random"}
   TRAINED_MODE = not DUMMY_MODE
-
-  # Check if this is a tracking task by checking for motion command.
-  is_tracking_task = (
-    env_cfg.commands is not None
-    and "motion" in env_cfg.commands
-    and isinstance(env_cfg.commands["motion"], MotionCommandCfg)
-  )
-
-  if is_tracking_task and cfg._demo_mode:
-    # Demo mode: use uniform sampling to see more diversity with num_envs > 1.
-    assert env_cfg.commands is not None
-    motion_cmd = env_cfg.commands["motion"]
-    assert isinstance(motion_cmd, MotionCommandCfg)
-    motion_cmd.sampling_mode = "uniform"
-
-  if is_tracking_task:
-    assert env_cfg.commands is not None
-    motion_cmd = env_cfg.commands["motion"]
-    assert isinstance(motion_cmd, MotionCommandCfg)
-
-    if DUMMY_MODE:
-      if not cfg.registry_name:
-        raise ValueError(
-          "Tracking tasks require `registry_name` when using dummy agents."
-        )
-      # Check if the registry name includes alias, if not, append ":latest".
-      registry_name = cfg.registry_name
-      if ":" not in registry_name:
-        registry_name = registry_name + ":latest"
-      import wandb
-
-      api = wandb.Api()
-      artifact = api.artifact(registry_name)
-      motion_cmd.motion_file = str(Path(artifact.download()) / "motion.npz")
-    else:
-      if cfg.motion_file is not None:
-        print(f"[INFO]: Using motion file from CLI: {cfg.motion_file}")
-        motion_cmd.motion_file = cfg.motion_file
-      else:
-        import wandb
-
-        api = wandb.Api()
-        if cfg.wandb_run_path is None and cfg.checkpoint_file is not None:
-          raise ValueError(
-            "Tracking tasks require `motion_file` when using `checkpoint_file`, "
-            "or provide `wandb_run_path` so the motion artifact can be resolved."
-          )
-        if cfg.wandb_run_path is not None:
-          wandb_run = api.run(str(cfg.wandb_run_path))
-          art = next(
-            (a for a in wandb_run.used_artifacts() if a.type == "motions"), None
-          )
-          if art is None:
-            raise RuntimeError("No motion artifact found in the run.")
-          motion_cmd.motion_file = str(Path(art.download()) / "motion.npz")
 
   log_dir: Path | None = None
   resume_path: Path | None = None
   if TRAINED_MODE:
     log_root_path = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
-    if cfg.checkpoint_file is not None:
-      resume_path = Path(cfg.checkpoint_file)
-      if not resume_path.exists():
-        raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
-      print(f"[INFO]: Loading checkpoint: {resume_path.name}")
-    else:
-      if cfg.wandb_run_path is None:
-        raise ValueError(
-          "`wandb_run_path` is required when `checkpoint_file` is not provided."
-        )
-      resume_path, was_cached = get_wandb_checkpoint_path(
-        log_root_path, Path(cfg.wandb_run_path)
-      )
-      # Extract run_id and checkpoint name from path for display.
-      run_id = resume_path.parent.name
-      checkpoint_name = resume_path.name
-      cached_str = "cached" if was_cached else "downloaded"
-      print(
-        f"[INFO]: Loading checkpoint: {checkpoint_name} (run: {run_id}, {cached_str})"
-      )
-    log_dir = resume_path.parent
+    del log_root_path
+    if cfg.checkpoint_file is None:
+      raise ValueError("--checkpoint-file is required for the trained agent (or use --agent zero / random)")
+    resume_path = Path(cfg.checkpoint_file)
+    if not resume_path.exists():
+      raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
+    print(f"[INFO]: Loading checkpoint: {resume_path.name}")
+    # a training run's directory keeps its videos; a loose checkpoint (e.g. ckpts/) writes under outputs/videos/<name>
+    log_dir = resume_path.parent if (resume_path.parent / "params").is_dir() else Path("outputs/videos") / resume_path.stem
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs
@@ -187,19 +181,13 @@ def run_play(task_id: str, cfg: PlayConfig):
           return 2 * torch.rand(action_shape, device=env.unwrapped.device) - 1
 
       policy = PolicyRandom()
-      
-    elif cfg.agent == "teleop":
-      from in_hand_rotation_mjlab.utils.policy_teleop_hand import PolicyTeleopHand
-
-      policy = PolicyTeleopHand(
-          device=env.unwrapped.device,
-      )
-
     else:
       raise RuntimeError(f"Unsupported dummy agent type: {cfg.agent}")
   else:
     runner_cls = load_runner_cls(task_id) or OnPolicyRunner
     runner = runner_cls(env, _prepare_agent_cfg(agent_cfg), device=device)
+    # the run recorded its training cfg, so compare against the task's training plant
+    check_checkpoint_plant(resume_path, load_env_cfg(task_id), task=task_id)
     runner.load(str(resume_path), map_location=device)
     policy = runner.get_inference_policy(device=device)
 
@@ -211,10 +199,16 @@ def run_play(task_id: str, cfg: PlayConfig):
   else:
     resolved_viewer = cfg.viewer
 
-  if resolved_viewer == "native":
+  if resolved_viewer == "none":
+    obs = env.get_observations()
+    with torch.no_grad():
+      for _ in range(cfg.video_length + 1):
+        obs, _, _, _ = env.step(policy(obs))
+    print(f"[INFO]: Ran {cfg.video_length} steps without a viewer" + (f"; video in {log_dir / 'videos' / 'play'}" if cfg.video and log_dir else ""))
+  elif resolved_viewer == "native":
     NativeMujocoViewer(env, policy).run()
   elif resolved_viewer == "viser":
-    ViserPlayViewer(env, policy).run()
+    TaskCenteredViserPlayViewer(env, policy).run()
   else:
     raise RuntimeError(f"Unsupported viewer backend: {resolved_viewer}")
 
@@ -224,10 +218,9 @@ def run_play(task_id: str, cfg: PlayConfig):
 def main():
   # Parse first argument to choose the task.
   # Import tasks to populate the registry.
-  import mjlab.tasks  # noqa: F401
   import in_hand_rotation_mjlab.tasks  # noqa: F401
 
-  all_tasks = list_tasks()
+  all_tasks = [t for t in list_tasks() if t.startswith("Mjlab-Leap")]
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,

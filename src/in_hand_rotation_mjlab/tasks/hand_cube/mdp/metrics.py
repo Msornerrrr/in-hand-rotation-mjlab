@@ -187,3 +187,15 @@ class object_pose_rp_error_from_reset:
     metric = pos_error if self._component == "position" else tilt_error
     metric = sanitize_to_range(metric, 0.0, 1e6, nan_default=0.0)
     return torch.where(self._has_init, metric, torch.zeros_like(metric))
+
+# ---------------------------------------------------------------------------
+# SO(3) cube reorientation (reorient_env_cfg.py)
+def track_peak_forces(env):
+  """Per-substep metric: running max of the hand-cube / hand-self contact force within the
+  current control step (read and cleared by ``peak_force_excess_sq``). Impacts last a few
+  ms, so a force sampled only at the end of the 50 ms step misses them."""
+  for key, sensor in (("_peak_cube_force", "safety_hand_cube"), ("_peak_self_force", "safety_hand_self")):
+    f = env.scene.sensors[sensor].data.force.norm(dim=-1).amax(-1)
+    cur = getattr(env, key, None)
+    setattr(env, key, f if cur is None else torch.maximum(cur, f))
+  return env._peak_cube_force

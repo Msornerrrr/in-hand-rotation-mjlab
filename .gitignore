@@ -58,7 +58,16 @@ Thumbs.db
 
 # uv
 .venv/
-uv.lock
+# uv.lock is committed (v2): it pins the simulator stack the released checkpoints were made with
 
-# Others
-data/
+# v2: run outputs, downloaded data and release packages
+/outputs/
+/logs/
+/data/
+/release/
+ckpts/**/*_models.pt
+*.tar.gz
+*.part
+
+# MuJoCo writes its warnings to the working directory
+MUJOCO_LOG.TXT

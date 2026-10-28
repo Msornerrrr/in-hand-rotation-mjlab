@@ -11,15 +11,16 @@ def leap_left_custom_hand_cube_rotate_ppo_cfg() -> RslRlOnPolicyRunnerCfg:
       hidden_dims=(512, 512, 256),
       activation="elu",
       obs_normalization=True,
-      stochastic=True,
-      init_noise_std=0.7,
+      distribution_cfg={
+        "class_name": "GaussianDistribution",
+        "init_std": 0.7,
+        "std_type": "scalar",
+      },
     ),
     critic=RslRlModelCfg(
       hidden_dims=(512, 512, 256),
       activation="elu",
       obs_normalization=True,
-      stochastic=False,
-      init_noise_std=0.7,
     ),
     algorithm=RslRlPpoAlgorithmCfg(
       value_loss_coef=1.0,
@@ -36,9 +37,21 @@ def leap_left_custom_hand_cube_rotate_ppo_cfg() -> RslRlOnPolicyRunnerCfg:
       max_grad_norm=1.0,
     ),
     experiment_name="leap_left_hand_cube_rotate",
+    logger="tensorboard",
     save_interval=100,
     num_steps_per_env=32,
     max_iterations=5_000,
     clip_actions=1.0,
   )
+
+
+def leap_left_custom_hand_cube_rotate_gear_ppo_cfg() -> RslRlOnPolicyRunnerCfg:
+  """The yaw recipe on the measured servo, in its own experiment, with the action std bounded
+  (rsl-rl's default std_range is unbounded: the 2026-02 yaw run ended at std ~10)."""
+  cfg = leap_left_custom_hand_cube_rotate_ppo_cfg()
+  cfg.actor.distribution_cfg = {**cfg.actor.distribution_cfg, "std_range": (0.05, 1.0)}
+  cfg.experiment_name = "leap_left_custom_hand_cube_rotate_gear"
+  return cfg
+
+
 leap_left_custom_hand_cube_rotate_rl_cfg = leap_left_custom_hand_cube_rotate_ppo_cfg

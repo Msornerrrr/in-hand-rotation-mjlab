@@ -58,6 +58,10 @@ class object_pose_rp_position_deviation_from_reset:
   ) -> torch.Tensor:
     del env, asset_cfg  # Bound once in __init__.
 
+    reset_mask = self._env.episode_length_buf <= 1
+    if torch.any(reset_mask):
+      self.reset(reset_mask.nonzero(as_tuple=False).squeeze(-1))
+
     pos_w = self._asset.data.root_link_pos_w
     roll, pitch, _ = euler_xyz_from_quat(self._asset.data.root_link_quat_w)
     pos_error = torch.linalg.vector_norm(pos_w - self._init_pos_w, dim=-1)

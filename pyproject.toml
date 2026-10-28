@@ -3,23 +3,45 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "in-hand-rotation-mjlab"
-version = "0.1.0"
-description = "In-hand cube rotation task using LEAP hand in MuJoCo with mjlab"
-requires-python = ">=3.10"
+name = "in_hand_rotation_mjlab"
+version = "2.0.0"
+description = "LEAP-hand in-hand rotation in mjlab: cube yaw, SO(3) reorientation and palm-down fingertip rotation of 22 objects, trained with PPO or with a learned differentiable world model (SuperMimic-style)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10,<3.13"
 dependencies = [
   "mjlab",
-  "pyzmq>=25",
+  "numpy>=1.24",
+  "pyyaml>=6",
+  "torch==2.11.0",
+  # the simulator stack the released policies were trained and evaluated with (newer warp-lang wheels target CUDA 13)
+  "warp-lang==1.14.0",
+  "mujoco-warp==3.10.0.1",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8"]
 
 [tool.uv]
 package = true
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [tool.uv.sources]
-mjlab = { git = "https://github.com/mujocolab/mjlab" }
+mjlab = { git = "https://github.com/mujocolab/mjlab", rev = "b546afe3696ad3da89b3b69f89dec6b1e3c9f953" }
+torch = { index = "pytorch-cu128" }
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.xml", "*.obj", "*.stl", "*.png", "*.npz", "*.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import re
 import numpy as np
 import torch
 
@@ -12,121 +13,17 @@ from mjlab.managers.event_manager import requires_model_fields
 from mjlab.utils.lab_api.math import (
   quat_from_euler_xyz,
   quat_mul,
-  sample_gaussian,
-  sample_log_uniform,
   sample_uniform,
 )
+
+from in_hand_rotation_mjlab.mdp.events import _resolve_env_ids, _resolve_geom_ids
+
+from .commands import GOAL
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 _DEFAULT_CUBE_CFG = SceneEntityCfg("cube", geom_names=("cube_geom",))
-
-
-def _resolve_env_ids(
-  env: ManagerBasedRlEnv, env_ids: torch.Tensor | slice | None
-) -> torch.Tensor:
-  if env_ids is None:
-    return torch.arange(env.num_envs, device=env.device, dtype=torch.int)
-  if isinstance(env_ids, slice):
-    start, stop, step = env_ids.indices(env.num_envs)
-    return torch.arange(start, stop, step, device=env.device, dtype=torch.int)
-  return env_ids.to(env.device, dtype=torch.int)
-
-
-def _resolve_geom_ids(
-  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-  if asset_cfg.geom_ids is None:
-    raise ValueError("asset_cfg.geom_ids must be resolved.")
-  if isinstance(asset_cfg.geom_ids, list):
-    return torch.tensor(asset_cfg.geom_ids, device=env.device, dtype=torch.int)
-  if isinstance(asset_cfg.geom_ids, torch.Tensor):
-    return asset_cfg.geom_ids.to(env.device, dtype=torch.int)
-  if isinstance(asset_cfg.geom_ids, slice):
-    entity: Entity = env.scene[asset_cfg.name]
-    return entity.indexing.geom_ids[asset_cfg.geom_ids]
-  return torch.tensor([asset_cfg.geom_ids], device=env.device, dtype=torch.int)
-
-
-def _resolve_body_ids(
-  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-  if asset_cfg.body_ids is None:
-    raise ValueError("asset_cfg.body_ids must be resolved.")
-  if isinstance(asset_cfg.body_ids, list):
-    return torch.tensor(asset_cfg.body_ids, device=env.device, dtype=torch.int)
-  if isinstance(asset_cfg.body_ids, torch.Tensor):
-    return asset_cfg.body_ids.to(env.device, dtype=torch.int)
-  if isinstance(asset_cfg.body_ids, slice):
-    entity: Entity = env.scene[asset_cfg.name]
-    return entity.indexing.body_ids[asset_cfg.body_ids]
-  return torch.tensor([asset_cfg.body_ids], device=env.device, dtype=torch.int)
-
-
-def _resolve_ctrl_ids(
-  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg
-) -> torch.Tensor:
-  asset: Entity = env.scene[asset_cfg.name]
-  raw_ctrl_ids = asset.indexing.ctrl_ids
-  if raw_ctrl_ids is None:
-    raise ValueError(f"Entity '{asset_cfg.name}' has no actuators.")
-  ctrl_ids = raw_ctrl_ids.to(env.device, dtype=torch.long)
-
-  def _select_from_ctrl_ids(ids: torch.Tensor) -> torch.Tensor | None:
-    if ids.numel() == 0:
-      return ctrl_ids.new_empty((0,), dtype=torch.long)
-    if bool(torch.all((ids >= -ctrl_ids.numel()) & (ids < ctrl_ids.numel()))):
-      return ctrl_ids[ids]
-    return None
-
-  actuator_ids = asset_cfg.actuator_ids
-  if isinstance(actuator_ids, slice):
-    return ctrl_ids[actuator_ids]
-  if isinstance(actuator_ids, list):
-    actuator_ids_t = torch.tensor(actuator_ids, device=env.device, dtype=torch.long)
-  elif isinstance(actuator_ids, torch.Tensor):
-    actuator_ids_t = actuator_ids.to(env.device, dtype=torch.long)
-  else:
-    actuator_ids_t = torch.tensor([actuator_ids], device=env.device, dtype=torch.long)
-
-  selected = _select_from_ctrl_ids(actuator_ids_t)
-  if selected is not None:
-    return selected
-
-  # Fallback for grouped/wrapped actuator configurations: resolve through
-  # entity actuator objects and collect their MuJoCo control IDs.
-  num_actuators = len(asset.actuators)
-  if num_actuators > 0:
-    valid = (actuator_ids_t >= -num_actuators) & (actuator_ids_t < num_actuators)
-    if bool(torch.any(valid)):
-      obj_ids = actuator_ids_t[valid]
-      obj_ids = torch.where(obj_ids < 0, obj_ids + num_actuators, obj_ids)
-      gathered = []
-      for idx in obj_ids.tolist():
-        gathered.append(asset.actuators[int(idx)].global_ctrl_ids.to(env.device))
-      if len(gathered) > 0:
-        return torch.unique(torch.cat(gathered).to(torch.long), sorted=True)
-
-  return ctrl_ids
-
-
-def _sample_distribution(
-  distribution: str,
-  lower: float,
-  upper: float,
-  shape: tuple[int, ...],
-  device: str,
-) -> torch.Tensor:
-  low = torch.tensor(lower, device=device, dtype=torch.float32)
-  high = torch.tensor(upper, device=device, dtype=torch.float32)
-  if distribution == "uniform":
-    return sample_uniform(low, high, shape, device=device)
-  if distribution == "log_uniform":
-    return sample_log_uniform(low, high, shape, device=device)
-  if distribution == "gaussian":
-    return sample_gaussian(low, high, shape, device=device)
-  raise ValueError(f"Unsupported distribution: {distribution}")
 
 
 def _load_grasp_cache(
@@ -379,186 +276,6 @@ def randomize_shared_contact_friction(
     )
 
 
-@requires_model_fields("body_mass")
-def randomize_body_mass(
-  env: ManagerBasedRlEnv,
-  env_ids: torch.Tensor | slice | None,
-  mass_range: tuple[float, float],
-  asset_cfg: SceneEntityCfg,
-  distribution: str = "uniform",
-  operation: str = "scale",
-  min_mass: float = 1e-5,
-) -> None:
-  """Randomize body masses for selected asset bodies.
-
-  Supports ``operation`` in ``{"scale", "abs", "add"}``.
-  """
-  env_ids = _resolve_env_ids(env, env_ids)
-  if len(env_ids) == 0:
-    return
-  body_ids = _resolve_body_ids(env, asset_cfg)
-  if len(body_ids) == 0:
-    return
-
-  current = env.sim.model.body_mass[env_ids[:, None], body_ids[None, :]]
-  if operation == "scale":
-    base = env.sim.get_default_field("body_mass")[body_ids].unsqueeze(0).expand_as(current)
-    scale = _sample_distribution(
-      distribution=distribution,
-      lower=mass_range[0],
-      upper=mass_range[1],
-      shape=current.shape,
-      device=env.device,
-    )
-    out = base * scale
-  elif operation == "abs":
-    out = _sample_distribution(
-      distribution=distribution,
-      lower=mass_range[0],
-      upper=mass_range[1],
-      shape=current.shape,
-      device=env.device,
-    )
-  elif operation == "add":
-    base = env.sim.get_default_field("body_mass")[body_ids].unsqueeze(0).expand_as(current)
-    delta = _sample_distribution(
-      distribution=distribution,
-      lower=mass_range[0],
-      upper=mass_range[1],
-      shape=current.shape,
-      device=env.device,
-    )
-    out = base + delta
-  else:
-    raise ValueError(f"Unsupported operation '{operation}'.")
-
-  env.sim.model.body_mass[env_ids[:, None], body_ids[None, :]] = torch.clamp(
-    out, min=min_mass
-  )
-
-
-@requires_model_fields("actuator_forcerange", "actuator_forcelimited")
-def set_actuator_effort_limits(
-  env: ManagerBasedRlEnv,
-  env_ids: torch.Tensor | slice | None,
-  effort_limit: float | tuple[float, float],
-  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", actuator_names=(".*",)),
-) -> None:
-  """Set actuator effort limits and enable force limiting in MuJoCo."""
-  from mjlab.actuator import IdealPdActuator
-  from mjlab.actuator.delayed_actuator import DelayedActuator
-
-  env_ids = _resolve_env_ids(env, env_ids)
-  if len(env_ids) == 0:
-    return
-  asset: Entity = env.scene[asset_cfg.name]
-  ctrl_ids = _resolve_ctrl_ids(env, asset_cfg)
-  if len(ctrl_ids) == 0:
-    return
-
-  forcerange = env.sim.model.actuator_forcerange
-  forcelimited = env.sim.model.actuator_forcelimited
-
-  if forcerange.ndim == 3:
-    max_ctrl_id = int(forcerange.shape[1])
-  elif forcerange.ndim == 2:
-    max_ctrl_id = int(forcerange.shape[0])
-  else:
-    raise RuntimeError(
-      f"Unsupported actuator_forcerange shape {tuple(forcerange.shape)}; expected 2D or 3D."
-    )
-
-  valid_ctrl = (ctrl_ids >= 0) & (ctrl_ids < max_ctrl_id)
-  if not bool(torch.all(valid_ctrl)):
-    ctrl_ids = ctrl_ids[valid_ctrl]
-  if len(ctrl_ids) == 0:
-    return
-
-  if forcerange.ndim == 3:
-    if isinstance(effort_limit, tuple):
-      limits = sample_uniform(
-        effort_limit[0],
-        effort_limit[1],
-        (len(env_ids), len(ctrl_ids)),
-        device=env.device,
-      )
-    else:
-      limits = torch.full(
-        (len(env_ids), len(ctrl_ids)),
-        float(effort_limit),
-        dtype=torch.float32,
-        device=env.device,
-      )
-    limits = torch.clamp(limits, min=1e-6)
-    forcerange[env_ids[:, None], ctrl_ids[None, :], 0] = -limits
-    forcerange[env_ids[:, None], ctrl_ids[None, :], 1] = limits
-  elif forcerange.ndim == 2:
-    if isinstance(effort_limit, tuple):
-      limits = sample_uniform(
-        effort_limit[0],
-        effort_limit[1],
-        (len(ctrl_ids),),
-        device=env.device,
-      )
-    else:
-      limits = torch.full(
-        (len(ctrl_ids),),
-        float(effort_limit),
-        dtype=torch.float32,
-        device=env.device,
-      )
-    limits = torch.clamp(limits, min=1e-6)
-    forcerange[ctrl_ids, 0] = -limits
-    forcerange[ctrl_ids, 1] = limits
-  else:
-    raise RuntimeError(
-      f"Unsupported actuator_forcerange shape {tuple(forcerange.shape)}; expected 2D or 3D."
-    )
-
-  # actuator_forcelimited is often shared across envs (shape: [nu]) even when
-  # actuator_forcerange is expanded per-env.
-  if forcelimited.ndim == 1:
-    max_force_limited = int(forcelimited.shape[0])
-    valid_force_limited = (ctrl_ids >= 0) & (ctrl_ids < max_force_limited)
-    if bool(torch.any(valid_force_limited)):
-      forcelimited[ctrl_ids[valid_force_limited]] = 1
-  elif forcelimited.ndim == 2:
-    max_force_limited = int(forcelimited.shape[1])
-    valid_force_limited = (ctrl_ids >= 0) & (ctrl_ids < max_force_limited)
-    if bool(torch.any(valid_force_limited)):
-      valid_ctrl_ids = ctrl_ids[valid_force_limited]
-      forcelimited[env_ids[:, None], valid_ctrl_ids[None, :]] = 1
-  else:
-    raise RuntimeError(
-      f"Unsupported actuator_forcelimited shape {tuple(forcelimited.shape)}; expected 1D or 2D."
-    )
-
-  # Keep custom IdealPd actuator internal limits in sync with model forcerange.
-  # Entity-level actuator objects may be grouped (e.g., one object controlling
-  # multiple MuJoCo actuators), so we match by ctrl-id intersection instead of
-  # indexing asset.actuators with manager-resolved actuator IDs.
-  actuators = list(asset.actuators)
-
-  ctrl_index = {int(cid.item()): i for i, cid in enumerate(ctrl_ids)}
-  for actuator in actuators:
-    base_actuator = (
-      actuator.base_actuator if isinstance(actuator, DelayedActuator) else actuator
-    )
-    if not isinstance(base_actuator, IdealPdActuator):
-      continue
-
-    act_ctrl_ids = [int(cid.item()) for cid in base_actuator.global_ctrl_ids]
-    cols = [ctrl_index[cid] for cid in act_ctrl_ids if cid in ctrl_index]
-    if len(cols) == 0:
-      continue
-
-    if forcerange.ndim == 3:
-      act_limits = limits[:, cols]
-    else:
-      act_limits = limits[cols].unsqueeze(0).expand(len(env_ids), -1)
-    base_actuator.set_effort_limit(env_ids, effort_limit=act_limits)
-
-
 def inject_random_cube_pose(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | slice | None,
@@ -641,3 +358,129 @@ def apply_random_cube_wrench(
     body_ids=local_ids.tolist(),
     env_ids=env_ids,
   )
+
+# ---------------------------------------------------------------------------
+# SO(3) cube reorientation (reorient_env_cfg.py)
+@requires_model_fields("geom_friction")
+def randomize_split_contact_friction(env, env_ids, pad_range, other_range):
+  """Sliding friction per surface class: the fingertip pads (``robot/*_tip``) get one sample,
+  every other hand geom and the cube share another (MuJoCo mixes same-priority geoms by max;
+  the pads, priority 2, win theirs). Geoms are resolved by their compiled names: the entity's
+  ``geom_names`` selector maps the tip meshes one geom off."""
+  import mujoco
+
+  from in_hand_rotation_mjlab.robots.leap_hand.pad_model import is_pad_geom
+
+  env_ids = _resolve_env_ids(env, env_ids)
+  if len(env_ids) == 0:
+    return
+  ids = getattr(env, "_split_friction_ids", None)
+  if ids is None:
+    m = env.sim.mj_model
+    names = [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_GEOM, i) or "" for i in range(m.ngeom)]
+    hand = [i for i, n in enumerate(names) if n.startswith("robot/")]
+    # the tip meshes, or their convex pieces under a decomposed pad model (robots/leap_hand/pad_model.py)
+    pads = [i for i in hand if is_pad_geom(names[i])]
+    # the object's geoms: "cube/cube_geom", plus the box / cylinder geoms of the multi-shape object
+    other = [i for i in hand if i not in pads] + [i for i, n in enumerate(names) if re.fullmatch(r"cube/cube_geom(_\w+)?", n)]
+    assert len(pads) % 4 == 0 and pads, pads
+    ids = env._split_friction_ids = (torch.tensor(pads, device=env.device), torch.tensor(other, device=env.device))
+  pads, other = ids
+  n = len(env_ids)
+  f_other = other_range[0] + (other_range[1] - other_range[0]) * torch.rand(n, 1, device=env.device)
+  f_pad = pad_range[0] + (pad_range[1] - pad_range[0]) * torch.rand(n, 1, device=env.device)
+  env.sim.model.geom_friction[env_ids[:, None], other[None, :], 0] = f_other
+  env.sim.model.geom_friction[env_ids[:, None], pads[None, :], 0] = f_pad
+
+
+def reset_cube_freeze(env, env_ids, p_fh: tuple[float, float], p_hh: tuple[float, float]):
+  B, dev = env.num_envs, env.device
+  if not hasattr(env, "_cube_freeze"):
+    env._cube_freeze = dict(step=-1, held=torch.zeros(B, dtype=torch.bool, device=dev),
+                            p_fh=torch.zeros(B, device=dev), p_hh=torch.zeros(B, device=dev),
+                            pos=torch.zeros(B, 3, device=dev), quat=torch.zeros(B, 4, device=dev))
+    env._cube_freeze["quat"][:, 0] = 1.0
+  st = env._cube_freeze
+  if env_ids is None:
+    env_ids = torch.arange(B, device=dev)
+  n = len(env_ids)
+  st["held"][env_ids] = False  # a fresh estimate first; the chain may freeze it from the next step
+  st["p_fh"][env_ids] = p_fh[0] + (p_fh[1] - p_fh[0]) * torch.rand(n, device=dev)
+  st["p_hh"][env_ids] = p_hh[0] + (p_hh[1] - p_hh[0]) * torch.rand(n, device=dev)
+
+
+# ---------------------------------------------------------------------------
+# Reverse curriculum from the sampling-MPC expert: start an episode from an expert state,
+# with the goal the expert was pursuing there and reached ``sts`` steps later.
+_RC_POOL: dict = {}
+
+
+def _rc_pool(pattern: str, device):
+  if pattern not in _RC_POOL:
+    import glob
+    import numpy as np
+
+    keys = ("joint_pos", "cmd", "cube_pos", "cube_quat", "goal_quat")
+    keep = {k: [] for k in keys + ("sts",)}
+    files = sorted(f for g in pattern.split(";") for f in glob.glob(g))
+    for f in files:
+      d = np.load(f)
+      alive, succ, gid = d["alive"], d["success"], d["goal_id"]
+      T, M = alive.shape
+      by_student = d["by_student"] if "by_student" in d.files else np.zeros_like(alive)
+      sts = np.full((T, M), np.inf, dtype=np.float32)
+      last = np.full(M, -1)
+      for t in range(T - 1, -1, -1):
+        # success[t]: the step taken from row t reached the goal of row t; a goal change
+        # after row t without success is a timeout (the expert never reached that goal)
+        changed = np.zeros(M, dtype=bool) if t == T - 1 else gid[t + 1] != gid[t]
+        last = np.where(succ[t], t, np.where(changed, -1, last))
+        sts[t] = np.where(last >= 0, last - t + 1, np.inf)
+      ok = alive & np.isfinite(sts) & ~by_student.astype(bool)
+      for k in keys:
+        keep[k].append(d[k][ok])
+      keep["sts"].append(sts[ok])
+    if not files or not sum(len(v) for v in keep["sts"]):
+      raise FileNotFoundError(f"no usable demo shards match {pattern}")
+    pool = {k: torch.as_tensor(np.concatenate(v), dtype=torch.float32, device=device) for k, v in keep.items()}
+    order = pool["sts"].argsort()
+    _RC_POOL[pattern] = {k: v[order] for k, v in pool.items()}
+    print(f"[reverse curriculum] {len(order)} expert states from {len(files)} shards; "
+          f"steps-to-goal median {float(pool['sts'].median()):.0f}, max {float(pool['sts'].max()):.0f}", flush=True)
+  return _RC_POOL[pattern]
+
+
+def reset_reverse_curriculum(env, env_ids, shard_glob: str, prob: float, cube_cfg: SceneEntityCfg):
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  if not hasattr(env, "_rc_pending"):
+    env._rc_pending = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    env._rc_goal = torch.zeros(env.num_envs, 4, device=env.device)
+  if len(env_ids) == 0:
+    return
+  pick = torch.rand(len(env_ids), device=env.device) < prob
+  env._rc_pending[env_ids] = pick
+  ids = env_ids[pick]
+  if len(ids) == 0:
+    return
+  pool = _rc_pool(shard_glob, env.device)
+  try:
+    rc_steps = env.command_manager.get_term(GOAL).rc_steps
+  except Exception:  # managers not built yet (first reset during construction)
+    rc_steps = 10.0
+  n_ok = max(1, int(torch.searchsorted(pool["sts"], torch.tensor(rc_steps, device=env.device), right=True)))
+  rows = torch.randint(n_ok, (len(ids),), device=env.device)
+  robot, cube = env.scene["robot"], env.scene["cube"]
+  robot.write_joint_state_to_sim(pool["joint_pos"][rows], torch.zeros_like(pool["joint_pos"][rows]), env_ids=ids)
+  state = torch.zeros(len(ids), 13, device=env.device)
+  state[:, :3] = pool["cube_pos"][rows] + env.scene.env_origins[ids]  # demos were recorded with zero env spacing
+  state[:, 3:7] = pool["cube_quat"][rows]
+  cube.write_root_state_to_sim(state, env_ids=ids)
+  # the demos used the nominal cube; undo the grasp-cache event's size randomization
+  geom_ids = _resolve_geom_ids(env, cube_cfg)
+  nominal = env.sim.get_default_field("geom_size")[geom_ids]
+  env.sim.model.geom_size[ids[:, None], geom_ids[None, :], :] = nominal[None]
+  term = env.action_manager.get_term("joint_pos")
+  term._target[ids] = pool["cmd"][rows]
+  term.stage_restored_reset_target(ids)
+  env._rc_goal[ids] = pool["goal_quat"][rows]

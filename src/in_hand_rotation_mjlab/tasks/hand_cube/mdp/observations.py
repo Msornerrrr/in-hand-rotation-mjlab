@@ -12,6 +12,10 @@ from mjlab.utils.lab_api.math import (
   quat_mul,
 )
 
+from in_hand_rotation_mjlab.tasks.hand_cube.quat_utils import quat_to_mat, rot6d
+
+from .commands import GOAL
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
@@ -256,3 +260,72 @@ def cube_friction_coeff(
 
   friction = env.sim.model.geom_friction[:, geom_world_id, axis]
   return friction.unsqueeze(-1)
+
+# ---------------------------------------------------------------------------
+# SO(3) cube reorientation (reorient_env_cfg.py)
+CUBE_CENTER = (-0.092, 0.055, 0.245)  # approx. resting cube position on the custom palm
+
+
+# identical to the BC student's features (sampling/bc.py)
+def joint_pos_abs(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+  return env.scene[asset_cfg.name].data.joint_pos
+
+
+def cube_pos_rel(env, center=CUBE_CENTER):
+  cube = env.scene["cube"]
+  c = torch.tensor(center, device=env.device)
+  return cube.data.root_link_pos_w - env.scene.env_origins - c
+
+
+def cube_rot6d(env):
+  return rot6d(quat_to_mat(env.scene["cube"].data.root_link_quat_w))
+
+
+def goal_rot6d(env, command_name: str = GOAL):
+  return rot6d(quat_to_mat(env.command_manager.get_command(command_name)))
+
+
+def goal_rel_rot6d(env, command_name: str = GOAL):
+  Rc = quat_to_mat(env.scene["cube"].data.root_link_quat_w)
+  Rg = quat_to_mat(env.command_manager.get_command(command_name))
+  return rot6d(Rg @ Rc.transpose(-1, -2))
+
+
+def cube_lin_vel(env):
+  return env.scene["cube"].data.root_link_lin_vel_w
+
+
+def cube_ang_vel(env):
+  return env.scene["cube"].data.root_link_ang_vel_w
+
+
+# The cube pose as a vision tracker reports it (Sim2RealCfg.freeze)
+def _frozen_cube_state(env):
+  """The cube pose as a vision tracker reports it: per env, a Markov chain holds the last
+  estimate (``reset_cube_freeze`` samples the chain per episode). Advanced once per step."""
+  cube = env.scene["cube"]
+  pos, quat = cube.data.root_link_pos_w - env.scene.env_origins, cube.data.root_link_quat_w
+  st = getattr(env, "_cube_freeze", None)
+  if st is None:
+    return pos, quat
+  if st["step"] != env.common_step_counter:
+    st["step"] = env.common_step_counter
+    u = torch.rand(env.num_envs, device=env.device)
+    st["held"] = torch.where(st["held"], u < st["p_hh"], u < st["p_fh"])
+    fresh = ~st["held"]
+    st["pos"][fresh], st["quat"][fresh] = pos[fresh], quat[fresh]
+  return st["pos"], st["quat"]
+
+
+def cube_pos_rel_frozen(env, center=CUBE_CENTER):
+  return _frozen_cube_state(env)[0] - torch.tensor(center, device=env.device)
+
+
+def cube_rot6d_frozen(env):
+  return rot6d(quat_to_mat(_frozen_cube_state(env)[1]))
+
+
+def goal_rel_rot6d_frozen(env, command_name: str = GOAL):
+  Rc = quat_to_mat(_frozen_cube_state(env)[1])
+  Rg = quat_to_mat(env.command_manager.get_command(command_name))
+  return rot6d(Rg @ Rc.transpose(-1, -2))

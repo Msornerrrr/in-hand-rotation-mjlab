@@ -1,7 +1,11 @@
 """LEAP Left hand cube rotation environment configuration."""
 
+from functools import partial
+
+from in_hand_rotation_mjlab.robots.leap_hand.leap_plant import LEAP_SERVO_CURRENT_PD, LeapServo
 from in_hand_rotation_mjlab.robots import get_leap_left_hand_cfg
 from in_hand_rotation_mjlab.tasks.hand_cube.hand_cube_env_cfg import (
+    Sim2RealCfg,
     make_hand_cube_embodiment_env_cfg,
 )
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -31,13 +35,20 @@ CUBE_SPAWN_POS = (-0.092, 0.055, 0.27)
 GRASP_CACHE_FILE = "tasks/hand_cube/cache/leap_left_grasp_cache.npz"
 
 
-def leap_left_hand_cube_rotate_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+def leap_left_hand_cube_rotate_env_cfg(
+    play: bool = False,
+    servo: LeapServo = LEAP_SERVO_CURRENT_PD,
+    sim2real: Sim2RealCfg | None = None,
+    max_command_lead: float | None = None,
+) -> ManagerBasedRlEnvCfg:
     """Create LEAP Left hand cube rotation environment configuration."""
     return make_hand_cube_embodiment_env_cfg(
-        robot_cfg_fn=get_leap_left_hand_cfg,
+        robot_cfg_fn=partial(get_leap_left_hand_cfg, servo=servo),
         grasp_init_joint_pos=GRASP_INIT_JOINT_POS,
         cube_spawn_pos=CUBE_SPAWN_POS,
         grasp_cache_file=GRASP_CACHE_FILE,
         negate_yaw_rate=True,  # Left hand: clockwise rotation is positive
         play=play,
+        sim2real=sim2real,
+        max_command_lead=max_command_lead,
     )

@@ -11,13 +11,14 @@ from pathlib import Path
 
 import mujoco
 
-from in_hand_rotation_mjlab import MYMJLAB_SRC_PATH
+from in_hand_rotation_mjlab import PACKAGE_PATH
 from mjlab.entity import EntityCfg
-from mjlab.utils.os import update_assets
 
+from in_hand_rotation_mjlab.robots.leap_hand.leap_plant import LEAP_SERVO_CURRENT_PD, LeapServo, LeapGearServo, leap_hand_spec_fn
 from in_hand_rotation_mjlab.robots.leap_hand.leap_right_constants import (
     configure_leap_spec_for_ideal_pd,
-    ARTICULATION,
+    update_assets,
+    leap_articulation,
     HOME_KEYFRAME as _BASE_HOME_KEYFRAME,
     LEAP_COLLISION,
 )
@@ -60,7 +61,7 @@ HOME_KEYFRAME = EntityCfg.InitialStateCfg(
 # -----------------------------------------------------------------------------
 
 leap_left_hand_XML: Path = (
-    MYMJLAB_SRC_PATH / "robots" / "leap_hand" / "xmls" / "left_hand.xml"
+    PACKAGE_PATH / "robots" / "leap_hand" / "xmls" / "left_hand.xml"
 )
 assert leap_left_hand_XML.exists(), f"Missing MJCF: {leap_left_hand_XML}"
 
@@ -70,7 +71,7 @@ def get_assets(meshdir: str) -> dict[str, bytes]:
     assets: dict[str, bytes] = {}
     update_assets(
         assets,
-        leap_left_hand_XML.parent.parent / "assets",
+        leap_left_hand_XML.parent / "assets",
         meshdir,
     )
     return assets
@@ -88,13 +89,13 @@ def get_spec() -> mujoco.MjSpec:
 # Final EntityCfg
 # -----------------------------------------------------------------------------
 
-def get_leap_left_hand_cfg() -> EntityCfg:
-    """Return mjlab EntityCfg for LEAP left hand."""
+def get_leap_left_hand_cfg(servo: LeapServo | LeapGearServo = LEAP_SERVO_CURRENT_PD) -> EntityCfg:
+    """Return mjlab EntityCfg for LEAP left hand. ``servo``: the servo-model version (leap_plant.py)."""
     return EntityCfg(
         init_state=HOME_KEYFRAME,
         collisions=(LEAP_COLLISION,),
-        spec_fn=get_spec,
-        articulation=ARTICULATION,
+        spec_fn=leap_hand_spec_fn(get_spec, servo),
+        articulation=leap_articulation(servo),
     )
 
 

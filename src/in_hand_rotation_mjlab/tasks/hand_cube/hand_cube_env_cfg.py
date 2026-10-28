@@ -1,3 +1,6 @@
+import os
+from dataclasses import dataclass
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.managers.action_manager import ActionTermCfg
@@ -11,11 +14,18 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
-from mjlab.terrains import TerrainImporterCfg
+from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
+from in_hand_rotation_mjlab.robots.leap_hand.leap_plant import (
+  LEAP_REFLECTED_ARMATURE,
+  LEAP_S2R_2026_10_CONTACT_DR,
+  LEAP_S2R_2026_10_DR,
+  LEAP_SERVO_S2R_2026_10,
+  LeapServo,
+)
 from in_hand_rotation_mjlab.tasks.hand_cube import mdp as hand_cube_mdp
-from in_hand_rotation_mjlab.tasks.hand_cube.mdp.actions import JointPositionDeltaActionCfg
+from in_hand_rotation_mjlab.mdp.actions import JointPositionDeltaActionCfg
 
 
 # Actor observation delay randomization (in env/control steps).
@@ -24,6 +34,20 @@ _ACTOR_OBS_DELAY_MIN_LAG = 0
 _ACTOR_OBS_DELAY_MAX_LAG = 1
 _ACTOR_OBS_DELAY_HOLD_PROB = 0.9
 _ACTOR_OBS_DELAY_UPDATE_PERIOD = 10
+
+
+def _cube_half_size_from_env(default: float) -> float:
+  """Read an optional play/train cube-size override from the environment."""
+  side_length = os.environ.get("HAND_CUBE_SIDE_LENGTH")
+  half_size = os.environ.get("HAND_CUBE_HALF_SIZE")
+
+  if side_length is not None:
+    default = 0.5 * float(side_length)
+  if half_size is not None:
+    default = float(half_size)
+  if default <= 0.0:
+    raise ValueError("Cube size must be positive.")
+  return default
 
 
 def make_hand_cube_inhand_rotate_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -362,7 +386,7 @@ def make_hand_cube_inhand_rotate_env_cfg() -> ManagerBasedRlEnvCfg:
 
   return ManagerBasedRlEnvCfg(
     scene=SceneCfg(
-      terrain=TerrainImporterCfg(terrain_type="plane"),
+      terrain=TerrainEntityCfg(),
       entities={},
       num_envs=1,
       env_spacing=0.6,
@@ -401,14 +425,121 @@ def make_hand_cube_inhand_rotate_env_cfg() -> ManagerBasedRlEnvCfg:
   )
 
 # Helper function to create embodiment-specific configs
+# ---------------------------------------------------------------------------
+# Sim-to-real recipe for the hand_cube tasks, from the first hardware runs of the SO(3)
+# reorientation policy (2026-10-05). On the real LEAP
+# the Lead20 policy dropped the cube every ~10 s: the real servos are ~2x faster/stiffer than
+# the training plant (replay fit Kp 4-8 N m/rad, 0-10 ms delay vs Kp 1.5 + 25-75 ms), the
+# printed links and cube are slippery, the vision pose freezes on ~40% of steps, and the
+# policy flicks the cube (p99 5 rad/s) with ~2.5x the yaw policy's contact force, running
+# motors at their limit (one shut down on overload). Every field is a switch, for ablations.
+@dataclass(frozen=True)
+class Sim2RealCfg:
+  delta: float | None = 1.0 / 12.0  # rad/step target slew (1.67 rad/s; Lead20: 0.2 = 4 rad/s)
+  # the servo model (robots/leap_hand/leap_plant.py): Kp 4 N m/rad (Lead20: KP15_PERJOINT, Kp 1.5)
+  servo: LeapServo | None = LEAP_SERVO_S2R_2026_10
+  kp_dr: tuple[float, float] | None = LEAP_S2R_2026_10_DR.kp_scale  # startup scale -> 3..6 N m/rad
+  kd_dr: tuple[float, float] | None = LEAP_S2R_2026_10_DR.kd_scale
+  effort: tuple[float, float] | None = LEAP_S2R_2026_10_DR.effort  # N m, absolute per joint per reset
+  armature_dr: tuple[float, float] | None = LEAP_S2R_2026_10_DR.armature_scale  # x the reflected rotor inertia
+  lag: tuple[int, int] | None = LEAP_S2R_2026_10_DR.lag  # command delay, physics substeps (0-25 ms; Lead20 5-15)
+  pad_friction: tuple[float, float] | None = LEAP_S2R_2026_10_CONTACT_DR.pad_friction  # pads (they win their contacts)
+  other_friction: tuple[float, float] | None = LEAP_S2R_2026_10_CONTACT_DR.other_friction  # links, palm, cube
+  peak_force: tuple[float, float, float] | None = (-3e-3, 6.0, 2.0)  # (w, free cube N, free self N)
+  torque_sat: tuple[float, float] | None = (-1.0, 0.8)  # (w, fraction of the effort limit)
+  joint_limit: float | None = -2.0  # rad beyond the soft limits (do not stall a joint on its stop)
+  cube_spin: tuple[float, float] | None = (-0.05, 2.0)  # (w, free rad/s)
+  # vision-pose freezes of the actor's cube_pos / cube_rot / rel_rot terms: per-episode Markov
+  # chain, P(fresh->held), P(held->held) ranges
+  freeze: tuple[tuple[float, float], tuple[float, float]] | None = ((0.0, 0.2), (0.5, 0.9))
+
+
+def apply_sim2real(cfg, s: Sim2RealCfg, play: bool) -> None:
+  """Apply ``s`` to a hand_cube env cfg (the servo version itself is chosen with the robot)."""
+  from mjlab.envs import mdp as mjlab_mdp
+  from mjlab.managers.event_manager import EventTermCfg
+
+  act = cfg.actions["joint_pos"]
+  if s.delta is not None:
+    act.delta_min, act.delta_max = -s.delta, s.delta
+  ev = cfg.events
+  if s.kp_dr is not None and "dr_robot_pd_gains" in ev:
+    ev["dr_robot_pd_gains"].params.update(kp_range=s.kp_dr, kd_range=s.kd_dr or (0.9, 1.1))
+  if s.effort is not None and "dr_effort_limits" in ev:
+    ev["dr_effort_limits"].params["effort_limit"] = s.effort
+  if s.armature_dr is not None and "dr_reflected_inertia" in ev:
+    ev["dr_reflected_inertia"].params["ranges"] = tuple(k * LEAP_REFLECTED_ARMATURE for k in s.armature_dr)
+  if s.lag is not None and "dr_action_delay" in ev:
+    ev["dr_action_delay"].params["lag_range"] = s.lag
+  if s.pad_friction is not None and "dr_shared_contact_friction" in ev:
+    ev.pop("dr_shared_contact_friction")
+    ev["dr_split_contact_friction"] = EventTermCfg(
+      func=hand_cube_mdp.randomize_split_contact_friction, mode="reset",
+      params={"pad_range": s.pad_friction, "other_range": s.other_friction})
+  if play:
+    return
+  robot = SceneEntityCfg("robot", joint_names=(".*",))
+  if s.torque_sat is not None:
+    cfg.rewards["torque_sat"] = RewardTermCfg(func=hand_cube_mdp.torque_near_limit, weight=s.torque_sat[0],
+                                              params={"frac": s.torque_sat[1]})
+  if s.joint_limit is not None:
+    cfg.rewards["joint_limit"] = RewardTermCfg(func=mjlab_mdp.joint_pos_limits, weight=s.joint_limit,
+                                               params={"asset_cfg": robot})
+  if s.cube_spin is not None:
+    cfg.rewards["cube_spin"] = RewardTermCfg(func=hand_cube_mdp.cube_angvel_excess_sq, weight=s.cube_spin[0],
+                                             params={"free": s.cube_spin[1]})
+  if s.freeze is not None:
+    terms = cfg.observations["actor"].terms
+    terms["cube_pos"].func = hand_cube_mdp.cube_pos_rel_frozen
+    terms["cube_rot"].func = hand_cube_mdp.cube_rot6d_frozen
+    terms["rel_rot"].func = hand_cube_mdp.goal_rel_rot6d_frozen
+    ev["reset_cube_freeze"] = EventTermCfg(func=hand_cube_mdp.reset_cube_freeze, mode="reset",
+                                           params={"p_fh": s.freeze[0], "p_hh": s.freeze[1]})
+
+
+# ---------------------------------------------------------------------------
+
+
+# The measured hand only (servo randomization, command delay, contact friction), without the
+# reorientation policy's action and reward shaping: for hand_cube tasks moved to the 2026-10
+# plant that keep their own action scale and rewards (the yaw rotation tasks).
+MEASURED_PLANT_2026_10 = Sim2RealCfg(delta=None, peak_force=None, torque_sat=None, joint_limit=None,
+                                     cube_spin=None, freeze=None)
+
+
+def measured_gear_plant(cfg, dr=None):
+  """A hand_cube env cfg (yaw or reorientation) on the measured LEAP servo, gear_2026_10.
+
+  ``use_leap_gear_servo`` (robots/leap_hand/leap_plant.py: the gear servo, its randomization,
+  the real hand's link masses), applied last, after the task's own sim-to-real recipe. The setpoint
+  is not interpolated across the 50 ms control step: the real dispatcher publishes one target per
+  step, and the servo samples it every 12.5 ms. ``dr``: the servo randomization (default the
+  version's measured uncertainty; ``LEAP_GEAR_SERVO_2026_10_NOMINAL`` for nominal evaluation).
+  """
+  from in_hand_rotation_mjlab.robots.leap_hand.leap_plant import LEAP_GEAR_SERVO_2026_10_DR, use_leap_gear_servo
+
+  use_leap_gear_servo(cfg, dr=dr or LEAP_GEAR_SERVO_2026_10_DR)
+  cfg.actions["joint_pos"].interpolate_decimation = False
+  return cfg
+
+
 def make_hand_cube_embodiment_env_cfg(
     *,
     robot_cfg_fn,
     grasp_init_joint_pos: dict[str, float],
     cube_spawn_pos: tuple[float, float, float],
-    grasp_cache_file: str,
+    grasp_cache_file: str | None,
     negate_yaw_rate: bool = True,
     play: bool = False,
+    palm_body_name: str = "palm",
+    palm_center_geom_expr: str = "palm_collision_.*",
+    fingertip_geom_expr: str = ".*_tip",
+    cube_half_size: float | None = None,
+    cube_mass: float = 0.1,
+    use_grasp_cache: bool = True,
+    enable_domain_randomization: bool = True,
+    sim2real: Sim2RealCfg | None = None,
+    max_command_lead: float | None = None,
 ) -> ManagerBasedRlEnvCfg:
     """Create hand_cube env config for a specific LEAP hand embodiment.
 
@@ -418,18 +549,25 @@ def make_hand_cube_embodiment_env_cfg(
         cube_spawn_pos: (x, y, z) spawn position for cube
         grasp_cache_file: Path to .npz grasp cache file
         negate_yaw_rate: Whether to negate yaw rate for rewards (True for left hand, False for right hand)
-        play: Whether this is for deployment (disables DR and sets infinite episode length)
+        play: Whether this is for deployment (nominal cube size, no observation noise or
+            curriculum, infinite episodes; domain randomization stays on,
+            ``enable_domain_randomization=False`` removes it)
+        sim2real: plant randomization / shaping recipe applied last (``Sim2RealCfg``)
+        max_command_lead: the |command - measured| clamp [rad] (the real LEAP driver's)
     """
     import mujoco
-    from in_hand_rotation_mjlab import MYMJLAB_SRC_PATH
+    from in_hand_rotation_mjlab import PACKAGE_PATH
     from mjlab.entity import EntityCfg
     from mjlab.sensor import ContactMatch, ContactSensorCfg
-    from in_hand_rotation_mjlab.robots.leap_hand.leap_right_constants import (
+    from in_hand_rotation_mjlab.robots.leap_hand.leap_plant import (
         LEAP_ACTUATOR_EFFORT_LIMIT_NM,
         LEAP_REFLECTED_ARMATURE,
     )
     
-    def get_cube_spec(cube_size: float = 0.0375, mass: float = 0.1) -> mujoco.MjSpec:
+    if cube_half_size is None:
+        cube_half_size = _cube_half_size_from_env(default=0.0375)
+
+    def get_cube_spec(cube_size: float = cube_half_size, mass: float = cube_mass) -> mujoco.MjSpec:
         spec = mujoco.MjSpec()
         body = spec.worldbody.add_body(name="cube")
         body.add_freejoint(name="cube_joint")
@@ -443,6 +581,15 @@ def make_hand_cube_embodiment_env_cfg(
         return spec
     
     cfg = make_hand_cube_inhand_rotate_env_cfg()
+
+    # Embodiment-specific palm geometry used by observations and frame debug viz.
+    for term_name in ("cube_pose_palm", "cube_lin_vel_palm", "cube_ang_vel_palm"):
+        cfg.observations["critic"].terms[term_name].params["hand_cfg"] = SceneEntityCfg(
+            "robot", body_names=(palm_body_name,)
+        )
+        cfg.observations["critic"].terms[term_name].params["palm_center_geom_expr"] = palm_center_geom_expr
+    cfg.commands["frame_viz"].palm_body_name = palm_body_name
+    cfg.commands["frame_viz"].palm_center_geom_expr = palm_center_geom_expr
 
     # Set embodiment-specific yaw reward sign
     cfg.rewards["rotate_finite_diff"].params["negate_yaw_rate"] = negate_yaw_rate
@@ -467,7 +614,7 @@ def make_hand_cube_embodiment_env_cfg(
     cfg.scene.sensors = (cfg.scene.sensors or ()) + (
         ContactSensorCfg(
             name="fingertip_cube_contact",
-            primary=ContactMatch(mode="geom", pattern=".*_tip", entity="robot"),
+            primary=ContactMatch(mode="geom", pattern=fingertip_geom_expr, entity="robot"),
             secondary=ContactMatch(mode="geom", pattern="cube_geom", entity="cube"),
             fields=("found",),
             reduce="none",
@@ -514,30 +661,29 @@ def make_hand_cube_embodiment_env_cfg(
     }
     
     # Grasp cache reset
-    cfg.events["reset_from_grasp_cache"] = EventTermCfg(
-        func=hand_cube_mdp.reset_from_grasp_cache,
-        mode="reset",
-        params={
-            "cache_file": str(MYMJLAB_SRC_PATH / grasp_cache_file),
-            "scale_list": (0.95, 0.9, 1.0, 1.05, 1.1),
-            "scale_jitter": 0.025,
-            "cube_cfg": SceneEntityCfg("cube", geom_names=("cube_geom",)),
-            "pose_range": {
-                "x": (-0.003, 0.003),
-                "y": (-0.003, 0.003),
-                "z": (-0.002, 0.002),
-                "yaw": (-3.14, 3.14),
+    if use_grasp_cache and grasp_cache_file is not None:
+        cfg.events["reset_from_grasp_cache"] = EventTermCfg(
+            func=hand_cube_mdp.reset_from_grasp_cache,
+            mode="reset",
+            params={
+                "cache_file": str(PACKAGE_PATH / grasp_cache_file),
+                "scale_list": (1.0,) if play else (0.95, 0.9, 1.0, 1.05, 1.1),
+                "scale_jitter": 0.0 if play else 0.025,
+                "cube_cfg": SceneEntityCfg("cube", geom_names=("cube_geom",)),
+                "pose_range": {
+                    "x": (-0.003, 0.003),
+                    "y": (-0.003, 0.003),
+                    "z": (-0.002, 0.002),
+                    "yaw": (-3.14, 3.14),
+                },
             },
-        },
-    )
+        )
     
     # Domain randomization events (shared across all embodiments)
     cfg.events["dr_cube_com"] = EventTermCfg(
-        func=envs_mdp.randomize_field,
+        func=hand_cube_mdp.randomize_body_ipos,
         mode="reset",
-        domain_randomization=True,
         params={
-            "field": "body_ipos",
             "ranges": {0: (-0.002, 0.002), 1: (-0.002, 0.002), 2: (-0.002, 0.002)},
             "distribution": "uniform",
             "operation": "add",
@@ -575,11 +721,9 @@ def make_hand_cube_embodiment_env_cfg(
         },
     )
     cfg.events["dr_motor_friction"] = EventTermCfg(
-        func=envs_mdp.randomize_field,
+        func=hand_cube_mdp.randomize_dof_frictionloss,
         mode="reset",
-        domain_randomization=True,
         params={
-            "field": "dof_frictionloss",
             "ranges": (0.5, 1.8),
             "distribution": "uniform",
             "operation": "scale",
@@ -587,11 +731,9 @@ def make_hand_cube_embodiment_env_cfg(
         },
     )
     cfg.events["dr_motor_damping"] = EventTermCfg(
-        func=envs_mdp.randomize_field,
+        func=hand_cube_mdp.randomize_dof_damping,
         mode="reset",
-        domain_randomization=True,
         params={
-            "field": "dof_damping",
             "ranges": (0.6, 1.6),
             "distribution": "uniform",
             "operation": "scale",
@@ -599,11 +741,9 @@ def make_hand_cube_embodiment_env_cfg(
         },
     )
     cfg.events["dr_reflected_inertia"] = EventTermCfg(
-        func=envs_mdp.randomize_field,
+        func=hand_cube_mdp.randomize_dof_armature,
         mode="startup",
-        domain_randomization=True,
         params={
-            "field": "dof_armature",
             "ranges": (0.7 * LEAP_REFLECTED_ARMATURE, 1.3 * LEAP_REFLECTED_ARMATURE),
             "distribution": "uniform",
             "operation": "abs",
@@ -611,7 +751,7 @@ def make_hand_cube_embodiment_env_cfg(
         },
     )
     cfg.events["dr_robot_pd_gains"] = EventTermCfg(
-        func=envs_mdp.randomize_pd_gains,
+        func=hand_cube_mdp.randomize_pd_gains,
         mode="startup",
         params={
             "kp_range": (0.9, 1.1),
@@ -622,7 +762,7 @@ def make_hand_cube_embodiment_env_cfg(
         },
     )
     cfg.events["dr_action_delay"] = EventTermCfg(
-        func=envs_mdp.sync_actuator_delays,
+        func=hand_cube_mdp.sync_actuator_delays,
         mode="reset",
         params={
             "lag_range": (
@@ -643,12 +783,32 @@ def make_hand_cube_embodiment_env_cfg(
             "asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",)),
         },
     )
+
+    if not enable_domain_randomization:
+        for event_name in (
+            "dr_cube_com",
+            "dr_shared_contact_friction",
+            "dr_cube_mass",
+            "dr_robot_link_masses",
+            "dr_motor_friction",
+            "dr_motor_damping",
+            "dr_reflected_inertia",
+            "dr_robot_pd_gains",
+            "dr_action_delay",
+            "dr_effort_limits",
+        ):
+            cfg.events.pop(event_name, None)
     
-    cfg.viewer.body_name = "palm"
+    cfg.viewer.body_name = palm_body_name
     
     if play:
         cfg.episode_length_s = 1e9
         cfg.observations["actor"].enable_corruption = False
         cfg.curriculum = {}
+
+    if max_command_lead is not None:
+        cfg.actions["joint_pos"].max_command_lead = max_command_lead
+    if sim2real is not None:
+        apply_sim2real(cfg, sim2real, play)
     
     return cfg

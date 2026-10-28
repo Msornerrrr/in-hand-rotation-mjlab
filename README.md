@@ -1,255 +1,197 @@
-# In-Hand Cube Rotation with LEAP Hand
+# In-Hand Rotation with the LEAP Hand in mjlab: PPO and World-Model RL
 
-<!-- TODO: Add badges here (License, DOI, etc.) -->
+In-hand manipulation with the [LEAP Hand](https://leaphand.com/) in [mjlab](https://github.com/mujocolab/mjlab): cube **yaw rotation**, **SO(3) reorientation** and palm-down **fingertip rotation of 22 objects**. Every task trains with **PPO**, and the yaw and fingertip tasks also train with a **learned differentiable world model** in the style of [SuperMimic](https://supermimic.github.io/). The robot model includes a servo model identified on the real hand, and the trained checkpoints are included.
 
-This repository contains Reinforcement Learning (RL) environments for in-hand cube rotation with the LEAP hand. The environments are built using the [MjLab](https://github.com/mujocolab/mjlab) framework and MuJoCo physics engine.
-
-<!-- Videos: GitHub doesn't support <video> tags, use GIF or link to external video -->
 <table align="center">
   <tr>
-    <td align="center" width="50%">
-      <img src="assets/sim_demo.gif" width="100%" alt="Simulation Demo"/>
-      <br/>
-      <em>Simulation</em>
-    </td>
-    <td align="center" width="50%">
-      <img src="assets/real_demo.gif" width="100%" alt="Real Robot Demo"/>
-      <br/>
-      <em>Real Robot (Video compressed)</em>
-    </td>
+    <td align="center" width="50%"><img src="assets/real_yaw.gif" width="100%" alt="Real LEAP hand rotating a cube about the vertical axis"/><br/><em>Real robot: cube yaw rotation (PPO)</em></td>
+    <td align="center" width="50%"><img src="assets/real_so3.gif" width="100%" alt="Real LEAP hand reorienting a cube to goal orientations"/><br/><em>Real robot: SO(3) reorientation, 6 cm cube, 4 goals in 18 s (PPO, the released checkpoint; inset = goal)</em></td>
   </tr>
 </table>
 
-The videos above show a trained policy rotating a cube in simulation (left) and on the real LEAP hand (right). The policy is trained using domain randomization and asymmetric actor-critic to enable robust sim-to-real transfer.
+<p align="center"><img src="assets/sim_fingertip.gif" width="90%" alt="Simulated LEAP hand palm down turning a sphere, cube, cylinder and cuboid on its fingertips"/><br/>
+<em>Simulation: palm-down fingertip rotation by the world-model policy, which reads only the hand's joints (no object state, no touch). Pad friction 0.35, about the real PaXini pads'. Top: from below; bottom: looking up the palm normal.</em></p>
 
-**Full deployment demo + failure cases:** [YouTube video](https://www.youtube.com/watch?v=5JPbPGIz82w)
+**v2 (this branch)** adds the SO(3) and fingertip tasks, the measured LEAP servo model, the world-model trainer and the released checkpoints. The original v1 release (yaw only, with its sim-to-real deployment code) is on the [`v1` branch](https://github.com/Msornerrrr/in-hand-rotation-mjlab/tree/v1). Full yaw deployment video and failure cases: [YouTube](https://www.youtube.com/watch?v=5JPbPGIz82w).
 
----
+## What is here
 
-**Built on prior work:** This implementation is based on the task design and reward formulations from [HORA](https://github.com/haozhiqi/hora) and uses robot models from [LEAP Hand Sim](https://github.com/leap-hand/LEAP_Hand_Sim). We re-implement these methods using the [MjLab](https://github.com/mujocolab/mjlab) framework to provide a modular, extensible codebase for in-hand manipulation research. We thank the authors of these prior works for their excellent contributions to the field!
+| Task | What it does | PPO | World model | Real robot |
+|---|---|---|---|---|
+| **Cube yaw** (palm up) | turn a cube about the vertical axis, proprioception only | ✅ checkpoint | ✅ checkpoint | ✅ video above |
+| **SO(3) reorientation** (5 / 6 / 7 cm cubes) | turn the cube to random goal orientations, with the cube pose from vision | ✅ checkpoints | — | ✅ video above |
+| **Fingertip rotation** (palm down, 22 objects) | spheres, cubes, cylinders and cuboids of 6–7.5 cm on the fingertip pads only | ✅ teacher + deployed student | ✅ privileged + proprio-only | — |
 
----
+All tasks run on the measured LEAP servo (current-limited Dynamixel position control, gearbox friction, 0.15 rad driver lead clamp, real link masses) with its randomization, so they train and evaluate on the plant the policies were deployed on.
 
-## Overview
+## Results
 
-This repository implements a complete sim-to-real pipeline for in-hand manipulation:
+<p align="center"><img src="assets/curves.png" width="100%" alt="Learning curves: world model vs PPO on cube yaw and fingertip rotation"/></p>
 
-- **Three LEAP hand embodiments**: right, left, and custom left hand variants
-- **Asymmetric actor-critic**: Noisy, delayed proprioception for the actor; full state for the critic
-- **Curriculum learning**: Penalties scale with rotation progress to enable gradual skill acquisition
-- **Domain randomization**: Cube properties, contact dynamics, and actuator parameters randomized for robust sim-to-real transfer
-- **Hardware deployment**: ZMQ-based policy server for real-time inference on physical hardware
+Wall-clock times are on one RTX 4090.
 
-The implementation supports **grasp cache generation**, **parallel training** (multi-GPU), **sim2sim testing**, **trajectory replay**, and **system identification** for actuator parameter fitting.
+**Cube yaw (palm up).** Evaluated over 60 s on 512 environments with the measured plant randomized.
 
----
+| Policy | Reward / s | Yaw rate | Wall clock | Env steps |
+|---|---|---|---|---|
+| PPO | 0.261 | 0.344 rad/s | 7.4 h | 393M |
+| World model | **0.292** | 0.335 rad/s | 2.5 h | 102M |
+
+The world-model policy passed PPO's *final* score after **25 minutes and 18M env steps**. PPO needed 6.5 hours and 262M steps to get there, so the world model was about 15× faster on both counts. Both policies read only the hand's joints and drop no cubes.
+
+**Palm-down fingertip rotation, 22 objects.** Evaluated at 64 rollouts per object, 60 s each, with pad friction (0.25–1.2), object mass and the servo randomized. "Rewarded yaw" is the rotation the task pays for, capped at 0.3 rad/s, out of a maximum of 1031°/60 s. "Dropped" means the object moved more than 30 mm from where it started.
+
+| Policy | Observations | How it was trained | Rewarded yaw | Raw yaw | Dropped |
+|---|---|---|---|---|---|
+| PPO teacher | privileged (object state, touch, pad friction) | PPO from scratch, 9.8 h, 682M steps | 944° | 1709° | 2.1% |
+| World model | privileged | 8.8 h from scratch + two 3 h fine-tunes | 927° | 1264° | 3.9% |
+| PPO student (deployed) | joints only | teacher → DAgger → two PPO fine-tunes (≈22 GPU-h) | 675° | 892° | 10.4% |
+| **World model** | **joints only** | world-model RL alone, no teacher (≈12 GPU-h) | **933°** | 1373° | 4.0% |
+
+The joints-only world-model policy beats the distilled student on every shape and drops less than half as often, without a teacher or DAgger. A single 3.5 GPU-hour run from scratch already passes the student. Its remaining weakness is cubes and cuboids at low pad friction, which slowly slip out of the grasp in a way the joints cannot sense.
+
+**SO(3) reorientation (PPO).** Goals reached per minute on the measured plant, mean of three randomized evaluation seeds:
+
+| Cube | 5 cm | 6 cm | 7 cm |
+|---|---|---|---|
+| goals / min | 18.8 | 17.3 | 15.2 |
 
 ## Install
 
-To install the repository, you need the [uv](https://docs.astral.sh/uv/) package manager. If you don't have it yet, install it by following the instructions [here](https://docs.astral.sh/uv/getting-started/installation/).
-
-Clone this repository and run:
+Requires an NVIDIA GPU with a driver that supports CUDA 12.8 (≥ 570) and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-cd ~/projects/in-hand-rotation-mjlab
-
-# Install dependencies
+git clone https://github.com/Msornerrrr/in-hand-rotation-mjlab.git
+cd in-hand-rotation-mjlab
 uv sync
+uv run python scripts/list_envs.py
 ```
 
----
+The simulator stack is pinned (mjlab at a fixed commit, mujoco-warp 3.10.0.1, warp-lang 1.14.0, torch 2.11 cu128) so that the released checkpoints behave as reported. `bash scripts/verify.sh` runs a few-minute smoke test of every entry point.
 
-**See [PIPELINE.md](PIPELINE.md) for the complete sim-to-real deployment pipeline**, including:
-- Grasp cache generation
-- Sim2sim deployment testing
-- Policy server setup
-- Trajectory recording and replay
-- System identification for actuator calibration
+**Data.** The fingertip start grasps and the yaw / SO(3) grasp caches ship with the package. Two downloads are only needed for training, from the [v2.0 release](https://github.com/Msornerrrr/in-hand-rotation-mjlab/releases/tag/v2.0), via `bash scripts/download_data.sh`:
+- the SO(3) expert demonstrations for the reverse curriculum (163 MB, into `data/reorient_demos/`);
+- the world-model weights that go with the released world-model actors (33 MB, into `ckpts/`), needed to fine-tune those actors.
 
----
-
-**Real-world setup:** see [`real_world/README.md`](real_world/README.md) for the Docker-based ROS runtime, deployment client, and sys-id collection commands.
-
----
-
-## Using a Pre-Trained Agent
-
-You can use a pre-trained agent directly in the MjLab environment to see the cube rotation behavior:
+## Quick start: the released policies
 
 ```bash
-uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate \
-  --checkpoint-file logs/rsl_rl/<experiment_name>/<timestamp>/model_*.pt
+export MUJOCO_GL=egl   # headless rendering
+
+# watch a PPO policy (native viewer with a display, otherwise a viser web viewer)
+uv run python scripts/play.py Mjlab-Leap-Left-Custom-HandCube-Rotate-Gear --checkpoint-file ckpts/yaw/ppo_gear_yaw.pt
+uv run python scripts/play.py Mjlab-Leap-Left-Custom-HandCube-Reorient-RC-Cube6-S2R3-Gear --checkpoint-file ckpts/so3/ppo_cube6_s2r3_gear.pt
+# headless: record an mp4 and exit
+uv run python scripts/play.py Mjlab-Leap-Left-Custom-HandCube-Rotate-Gear --checkpoint-file ckpts/yaw/ppo_gear_yaw.pt \
+  --num-envs 1 --video True --video-length 400 --viewer none
+
+# evaluate (PPO checkpoints and world-model actors alike)
+uv run python scripts/eval/eval_yaw.py --policy ckpts/yaw/wm_gear_yaw.pt --out outputs/eval/yaw_wm.json
+uv run python scripts/eval/eval_reorient.py --cond train_dr --task Mjlab-Leap-Left-Custom-HandCube-Reorient-RC-Cube5-S2R3-Gear \
+  --ckpt ckpts/so3/ppo_cube5_s2r3_gear.pt
+uv run python scripts/eval/eval_ftrot.py --policy ckpts/fingertip/wm_proprio.pt --per-obj 16 --out outputs/eval/ft_wm.json
+uv run python scripts/eval/eval_ftrot.py --policy ckpts/fingertip/ppo_student.pt \
+  --task Mjlab-Leap-Left-Custom-Fingertip-Rotate-PalmDown-MixFTF --per-obj 16 --out outputs/eval/ft_student.json
+
+# videos of the fingertip task: record rollouts (pad friction pinned), then render per object or as a grid
+uv run python scripts/eval/eval_ftrot.py --policy ckpts/fingertip/wm_proprio.pt --per-obj 2 --seconds 30 --pad-mu 0.35 \
+  --out outputs/eval/ft.json --record outputs/eval/ft.rec.pt
+uv run python scripts/render/render_ftrot.py --rec "World model=outputs/eval/ft.rec.pt" --grid --out outputs/eval/grid.mp4
+uv run python scripts/render/render_yaw.py --policy ckpts/yaw/wm_gear_yaw.pt --out outputs/eval/yaw_wm
 ```
 
-This repo also includes a sample checkpoint:
+| Checkpoint | Task | Notes |
+|---|---|---|
+| `ckpts/yaw/ppo_gear_yaw.pt` | `…-HandCube-Rotate-Gear` | PPO, iteration 2999; the policy deployed on the real hand |
+| `ckpts/yaw/wm_gear_yaw.pt` | `…-HandCube-Rotate-Gear` | world-model actor (16-step horizon, 2.5 h) |
+| `ckpts/so3/ppo_cube{5,6,7}_s2r3_gear.pt` | `…-Reorient-RC-Cube{5,6,7}-S2R3-Gear` | PPO, measured servo; the policies deployed on the real hand |
+| `ckpts/fingertip/ppo_teacher.pt` | `…-PalmDown-MixTeacherF` | privileged PPO teacher, iteration 2600 |
+| `ckpts/fingertip/ppo_student.pt` | `…-PalmDown-MixFTF` | the deployed joints-only student |
+| `ckpts/fingertip/wm_privileged.pt` | `…-PalmDown-MixTeacherF` | world-model actor, privileged inputs |
+| `ckpts/fingertip/wm_proprio.pt` | `…-PalmDown-MixTeacherF` (rewards) | world-model actor, joints only (the same inputs as the student) |
 
-- `ckpts/leap_left_custom_model_4900.pt` (task: `Mjlab-Leap-Left-Custom-HandCube-Rotate`)
+PPO checkpoints ship without their Adam moments (a fine-tune from them starts with a fresh optimizer). World-model actors are the exponential moving average of the actor's weights, which is what was evaluated.
 
-Example:
+## Training
+
+### PPO
 
 ```bash
-uv run python scripts/play.py Mjlab-Leap-Left-Custom-HandCube-Rotate \
-  --checkpoint-file ckpts/leap_left_custom_model_4900.pt
+uv run python scripts/train.py <task id> --env.scene.num-envs 4096 [--gpu-ids all] [--agent.run-name name]
 ```
 
-To test the environment with random actions before training:
+Runs log to `logs/rsl_rl/<experiment>/<date>_<name>/` (TensorBoard). Recipes:
+
+- **Yaw:** `Mjlab-Leap-Left-Custom-HandCube-Rotate-Gear`, 3000 iterations. The v1 embodiments `Mjlab-Leap-{Left,Right}-HandCube-Rotate` and `Mjlab-Leap-Left-Custom-HandCube-Rotate` are kept.
+- **SO(3)** (needs the demonstrations), in stages per cube size, each warm-started from the previous one with `--init-checkpoint-file <model> --init-checkpoint-load-critic True`:
+  1. `…-RC-Cube{5,6,7}`: reverse curriculum from the expert's states and goals.
+  2. `…-Final` (5 cm) or `…-FinalW` (6, 7 cm): home anchor and wall, cube-pose latency, a peak-force penalty.
+  3. `…-S2R3`: the sim-to-real recipe (stiffer and faster servos, per-surface friction, vision freezes, force and torque penalties).
+  4. `…-S2R3-Gear`: the same on the measured servo.
+
+  The released checkpoints also went through intermediate fine-tunes not registered here.
+- **Fingertip rotation:** `…-PalmDown-MixTeacherF` from scratch, 2600 iterations: the privileged teacher, with spheres and cylinders first and cubes and cuboids from iteration 800. The deployable student came from DAgger on `…-PalmDown-Mix`, then PPO fine-tunes on `…-MixFT` / `…-MixFTF`. The distillation script itself is not part of this release.
+
+### World model (SuperMimic-style)
 
 ```bash
-# Random actions
-uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate --agent random
+# cube yaw, from scratch (the released actor's run: one GPU, 2.5 h)
+uv run python scripts/wm/train_yaw.py --out outputs/wm/yaw --hours 2.5
 
-# Zero actions (observe passive dynamics)
-uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate --agent zero
+# fingertip rotation, joints-only actor, one run from scratch: the friction mixture from 6k updates, the drop penalty x3
+# from 5k, weight averaging, a 32-step horizon (10 h on one 24 GB GPU)
+uv run python scripts/wm/train_ftrot.py --out outputs/wm/ftrot_proprio --actor proprio --hours 10 \
+  --horizon 32 --starts 2048 --ckpt-min 30 --calibrate-term 0 --wm-drop-frac 0.1 --fail-head 1 --ema 0.999 \
+  --pad-friction-mix 0.25 0.55 0.5 --pad-friction-mix-from 6000 --drop-weight 3 --drop-weight-from 5000 \
+  --lr-decay-start 15000 --lr-decay-len 10000
+# the privileged actor: --actor priv
+
+# fine-tune a released actor, as the last stage of the released joints-only actor (needs its world model, from
+# scripts/download_data.sh; the update counter continues from the checkpoint's)
+uv run python scripts/wm/train_ftrot.py --out outputs/wm/ft_more --actor proprio --init ckpts/fingertip/wm_proprio.pt \
+  --hours 3 --horizon 32 --starts 2048 --stage2-steps 0 --ckpt-min 20 --calibrate-term 0 --wm-drop-frac 0.1 \
+  --fail-head 1 --ema 0.999 --pad-friction-mix 0.25 0.55 0.5 --lr-decay-start 10966 --lr-decay-len 4000 \
+  --lr-min-frac 0.5 --drop-weight 3
 ```
 
----
+Actors are checkpointed to `<out>/ckpt/actor_*.pt` every `--ckpt-min` minutes. `scripts/wm/watch_eval.sh <out>` scores each new checkpoint while training runs (set `EVAL=scripts/eval/eval_ftrot.py` for the fingertip task). `--max-updates N` stops after a fixed number of updates instead of a fixed time, which makes runs on different GPUs comparable.
 
-## Training Your Own Agent
+**How it works.** One loop, on one GPU:
+1. **Collect:** the actor runs in the simulator (4096 environments, a little action noise), filling a replay buffer.
+2. **Fit the world model:** an MLP (3×1024) learns the next state from the state, the joint command and the randomized plant parameters, on 8-step open-loop windows. A termination head predicts drops, with a correction for the oversampled drop windows. A contact head predicts pad forces for the contact rewards.
+3. **Imagine:** from states sampled out of the replay, the actor rolls the world model forward for H steps (16 for yaw, 32 for fingertip). Its return, the sum of the analytic task rewards weighted by survival, plus a TD(λ) critic at the horizon, is maximized by backpropagating through the model.
+4. **Critic:** TD(λ) on the imagined trajectories.
 
-You can customize the environments and train your own policies. Environment configurations are located at `src/in_hand_rotation_mjlab/tasks/hand_cube/config/<embodiment>/`.
+Lessons from the ablations:
+- **Weight averaging is decisive for the joints-only actor.** An EMA of the weights at 0.999 per update keeps drops at 5–8%; raw checkpoints swing between 20% and 70%.
+- **The number of updates is the biggest lever.** Doubling the updates of a fine-tune cut low-friction prism drops from 29% to 14%.
+- **A 32-step horizon beats 16 by 12–20 rewarded yaw at matched updates.** 48 and 64 steps were no better.
+- **Half the resets at low pad friction** (0.25–0.55) fix the joints-only actor's low-friction drops without hurting the rest.
+- **Averaging the weights of fine-tunes that share a start** (a "soup") lands at about their best member.
 
-### Test the Environment
-
-Before training, verify the environment setup:
-
-```bash
-uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate --agent random
-```
-
-### Start Training
-
-Train using parallel environments (GPU recommended):
-
-```bash
-uv run python scripts/train.py Mjlab-Leap-Left-HandCube-Rotate --env.scene.num-envs 4096
-```
-
-This uses 4096 parallel environments for efficient training. Checkpoints are saved to `logs/rsl_rl/<experiment_name>/<timestamp>/`.
-
-### Multi-GPU Training
-
-For multi-GPU training:
-
-```bash
-uv run python scripts/train.py Mjlab-Leap-Left-HandCube-Rotate --gpu-ids all
-```
-
-### Play Trained Policy
-
-Once training completes, evaluate the trained policy:
-
-```bash
-uv run python scripts/play.py Mjlab-Leap-Left-HandCube-Rotate \
-  --checkpoint-file logs/rsl_rl/<experiment_name>/<timestamp>/model_*.pt
-```
-
----
-
-## Deploying to Real Hardware
-
-For hardware deployment, we provide a ZMQ-based policy server that runs inference and communicates with the physical LEAP hand controller.
-
-For real hardware runtime/container setup, command launch, and system identification collection, see [`real_world/README.md`](real_world/README.md).
-
-Start the policy server:
-
-```bash
-uv run python scripts/policy_server_zmq.py Mjlab-Leap-Left-HandCube-Rotate \
-  --checkpoint-file logs/rsl_rl/<experiment_name>/<timestamp>/model_*.pt \
-  --bind tcp://0.0.0.0:5555
-```
-
-The server processes observations from hardware and returns joint position commands at 20 Hz.
-
----
-
-## Available Tasks
-
-| Task ID | Robot | Description |
-|---------|-------|-------------|
-| `Mjlab-Leap-Right-HandCube-Rotate` | LEAP Right | Right-handed cube rotation |
-| `Mjlab-Leap-Left-HandCube-Rotate` | LEAP Left | Left-handed cube rotation |
-| `Mjlab-Leap-Left-Custom-HandCube-Rotate` | LEAP Left Custom | Custom left hand variant |
-
-Each task can be customized independently via robot-specific parameters (grasp pose, spawn position, cache file) and shared configuration (observations, rewards, domain randomization).
-
----
-
-## Key Design Choices
-
-### Observations
-- **Actor** (deployed on hardware): Noisy, delayed joint positions (history=10) and commanded positions
-- **Critic** (training only): Full state including cube pose/velocity and physical parameters
-
-### Actions
-- Joint position delta: ±1/24 rad/step at 20 Hz control frequency
-
-### Rewards
-- Rotation progress (drift-gated to penalize unwanted axis rotation)
-- Penalties: linear velocity, pose deviation, torque, work
-- Curriculum: penalties scale with rotation progress for gradual learning
-
-### Domain Randomization
-- **Cube**: mass, size, center of mass, friction
-- **Contacts**: hand-cube friction coefficients
-- **Actuators**: friction, damping, PD gains, effort limits, control delays
-
-This enables robust policies that transfer from simulation to real hardware.
-
----
-
-## Project Structure
+## Layout
 
 ```
-in_hand_rotation_mjlab/
-├── src/in_hand_rotation_mjlab/
-│   ├── tasks/hand_cube/          # Task implementation
-│   │   ├── hand_cube_env_cfg.py  # Shared config + helper
-│   │   ├── config/               # Per-embodiment configs
-│   │   │   ├── leap_left/
-│   │   │   ├── leap_right/
-│   │   │   └── leap_left_custom/
-│   │   ├── mdp/                  # MDP modules (observations, rewards, etc.)
-│   │   └── cache/                # Grasp caches
-│   ├── robots/leap_hand/         # Robot models & assets
-│   ├── sim2sim/                  # Deployment testing infrastructure
-│   └── policy_server/            # ZMQ inference server for hardware
-└── scripts/                      # Training, evaluation, and deployment scripts
+src/in_hand_rotation_mjlab/
+  robots/leap_hand/        LEAP models (right, left, custom left), servo model versions (leap_plant.py, gear_servo.py),
+                           PaXini pad contact model (pad_model.py)
+  mdp/                     joint-delta action with the driver's lead clamp, randomization events
+  tasks/hand_cube/         yaw and SO(3) reorientation (configs in config/, grasp caches in cache/)
+  tasks/fingertip_rotate/  palm-down fingertip rotation of 22 objects (configs in config/, start grasps in data/)
+  world_model/             model, replay, actor / critic, task adapters (gear_yaw.py, ftrot_mix.py)
+scripts/
+  train.py, play.py, list_envs.py     PPO
+  wm/                                 world-model training (train_yaw.py, train_ftrot.py, watch_eval.sh)
+  eval/                               eval_yaw.py, eval_reorient.py, eval_ftrot.py
+  render/                             render_yaw.py, render_ftrot.py
+  verify.sh, download_data.sh
+ckpts/                                released policies
 ```
 
----
+## Acknowledgements
 
-## Roadmap
-
-**Current Release:**
-- ✅ Three LEAP hand embodiments (right, left, left custom)
-- ✅ Complete training pipeline with domain randomization
-- ✅ Sim2sim deployment testing
-- ✅ Policy server infrastructure for hardware deployment
-- ✅ System identification tools
-- ✅ Example Checkpoints
-- ✅ Real-world deployment code - Hardware interface code for LEAP hand
-- ✅ Hardware setup guide - Detailed instructions for physical LEAP hand
-
-**Planned Releases:**
-- 🔄 **TBD** - Maybe try rotation along all axis 🤔
-
----
+The yaw task design and reward follow [HORA](https://github.com/haozhiqi/hora), and the hand models come from [LEAP Hand Sim](https://github.com/leap-hand/LEAP_Hand_Sim). The world-model trainer follows [SuperMimic](https://supermimic.github.io/) ([paper](https://arxiv.org/abs/2610.28480)), adapted to in-hand manipulation. Everything runs on [mjlab](https://github.com/mujocolab/mjlab) and [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp), with PPO from [RSL-RL](https://github.com/leggedrobotics/rsl_rl). Thanks to the authors of these projects.
 
 ## License
 
-mjlab is licensed under the [Apache License, Version 2.0.](LICENSE)
-
----
-
-## Acknowledgments
-
-This work builds upon several excellent open-source projects:
-
-- **[MjLab](https://github.com/mujocolab/mjlab)** - The RL framework used for training and environment management. We thank the MjLab team for their excellent work on this framework for MJWarp-based robotics tasks.
-
-- **[HORA](https://github.com/haozhiqi/hora)** - Our task design, reward functions, and training methodology are based on the HORA paper. We thank the authors for their pioneering work on in-hand object rotation.
-
-- **[LEAP Hand Sim](https://github.com/leap-hand/LEAP_Hand_Sim)** - The LEAP hand robot models and assets are from this repository. We thank the LEAP hand team for making these resources available to the community.
-
-If you use this codebase, please also consider citing the original HORA and LEAP Hand papers that this work builds upon.
+Apache-2.0 (see [LICENSE](LICENSE)). The LEAP hand models keep their own license (`src/in_hand_rotation_mjlab/robots/leap_hand/xmls/LICENSE`).

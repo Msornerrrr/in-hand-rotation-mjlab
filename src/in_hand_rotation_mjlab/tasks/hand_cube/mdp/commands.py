@@ -14,9 +14,15 @@ from mjlab.utils.lab_api.math import (
   wrap_to_pi,
 )
 
+from in_hand_rotation_mjlab.tasks.hand_cube.quat_utils import axis_angle_quat, qmul, random_quat, rot_distance
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.viewer.debug_visualizer import DebugVisualizer
+
+
+def _viz_array(value: torch.Tensor):
+  return value.detach().cpu().numpy()
 
 
 class InHandYawCommand(CommandTerm):
@@ -168,8 +174,8 @@ class HandCubeFrameVizCommand(CommandTerm):
     for env_id in env_indices:
       if viz.show_world_frame:
         visualizer.add_frame(
-          position=self._env.scene.env_origins[env_id],
-          rotation_matrix=self._identity_rotm,
+          position=_viz_array(self._env.scene.env_origins[env_id]),
+          rotation_matrix=_viz_array(self._identity_rotm),
           scale=viz.world_frame_scale,
           axis_radius=viz.axis_radius,
           axis_colors=viz.world_axis_colors,
@@ -178,8 +184,8 @@ class HandCubeFrameVizCommand(CommandTerm):
 
       if viz.show_palm_body_frame:
         visualizer.add_frame(
-          position=palm_pos_w[env_id],
-          rotation_matrix=palm_rotm_w[env_id],
+          position=_viz_array(palm_pos_w[env_id]),
+          rotation_matrix=_viz_array(palm_rotm_w[env_id]),
           scale=viz.palm_body_frame_scale,
           axis_radius=viz.axis_radius,
           axis_colors=viz.palm_body_axis_colors,
@@ -188,8 +194,8 @@ class HandCubeFrameVizCommand(CommandTerm):
 
       if viz.show_palm_center_frame:
         visualizer.add_frame(
-          position=palm_center_pos_w[env_id],
-          rotation_matrix=palm_rotm_w[env_id],
+          position=_viz_array(palm_center_pos_w[env_id]),
+          rotation_matrix=_viz_array(palm_rotm_w[env_id]),
           scale=viz.palm_center_frame_scale,
           axis_radius=viz.axis_radius,
           axis_colors=viz.palm_center_axis_colors,
@@ -198,8 +204,8 @@ class HandCubeFrameVizCommand(CommandTerm):
 
       if viz.show_cube_frame:
         visualizer.add_frame(
-          position=cube_pos_w[env_id],
-          rotation_matrix=cube_rotm_w[env_id],
+          position=_viz_array(cube_pos_w[env_id]),
+          rotation_matrix=_viz_array(cube_rotm_w[env_id]),
           scale=viz.cube_frame_scale,
           axis_radius=viz.axis_radius,
           axis_colors=viz.cube_axis_colors,
@@ -208,8 +214,8 @@ class HandCubeFrameVizCommand(CommandTerm):
 
       if viz.show_palm_to_cube_arrow:
         visualizer.add_arrow(
-          start=palm_center_pos_w[env_id],
-          end=cube_pos_w[env_id],
+          start=_viz_array(palm_center_pos_w[env_id]),
+          end=_viz_array(cube_pos_w[env_id]),
           color=viz.palm_to_cube_arrow_color,
           width=viz.axis_radius,
           label=f"palm_to_cube_{env_id}",
@@ -217,13 +223,13 @@ class HandCubeFrameVizCommand(CommandTerm):
 
       if viz.show_frame_origins:
         visualizer.add_sphere(
-          center=palm_center_pos_w[env_id],
+          center=_viz_array(palm_center_pos_w[env_id]),
           radius=viz.origin_sphere_radius,
           color=viz.palm_center_origin_color,
           label=f"palm_center_origin_{env_id}",
         )
         visualizer.add_sphere(
-          center=cube_pos_w[env_id],
+          center=_viz_array(cube_pos_w[env_id]),
           radius=viz.origin_sphere_radius,
           color=viz.cube_origin_color,
           label=f"cube_origin_{env_id}",
@@ -309,3 +315,152 @@ class HandCubeFrameVizCommandCfg(CommandTermCfg):
 
   def build(self, env: ManagerBasedRlEnv) -> HandCubeFrameVizCommand:
     return HandCubeFrameVizCommand(self, env)
+
+# ---------------------------------------------------------------------------
+# SO(3) cube reorientation (reorient_env_cfg.py)
+GOAL = "goal"  # the reorientation goal command's name
+
+
+class CubeGoalCommand(CommandTerm):
+  cfg: CubeGoalCommandCfg
+
+  def __init__(self, cfg: CubeGoalCommandCfg, env):
+    super().__init__(cfg, env)
+    self.cube = env.scene[cfg.entity_name]
+    self.goal = torch.zeros(self.num_envs, 4, device=self.device)
+    self.goal[:, 0] = 1.0
+    self.metrics["rot_dist"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["successes"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["max_goal_angle"] = torch.zeros(self.num_envs, device=self.device)
+    # goal-distance curriculum: goals are the current orientation rotated by an angle in
+    # [min_goal_angle, max_angle]; max_angle grows while the success rate is high (pi = uniform SO(3))
+    self.max_angle = cfg.init_max_angle
+    self._attempts = 0.0
+    self._hits = 0.0
+    # Reverse curriculum (``reverse_curriculum``): ``reset_reverse_curriculum`` starts episodes
+    # from expert states whose goal the expert reached within ``rc_steps`` steps; rc_steps grows
+    # with the success rate on those first goals. Attempt kinds: 0 follow-up goal (angle
+    # curriculum), 1 expert-state first goal, 2 scratch first goal (uniform SO(3), the real task),
+    # 3 closed (counted; the next goal opens a new attempt).
+    self.rc_steps = float(cfg.rc_init_steps)
+    self.kind = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self._kind_att = [0.0, 0.0, 0.0]
+    self._kind_hit = [0.0, 0.0, 0.0]
+    self._kind_rate = [0.0, 0.0, 0.0]
+    self._in_reset = False
+    if cfg.reverse_curriculum:
+      for k in ("rc_steps", "rc_rate", "scratch_rate", "followup_rate"):
+        self.metrics[k] = torch.zeros(self.num_envs, device=self.device)
+
+  @property
+  def command(self) -> torch.Tensor:
+    return self.goal
+
+  def dist(self) -> torch.Tensor:
+    return rot_distance(self.cube.data.root_link_quat_w, self.goal)
+
+  def _update_metrics(self) -> None:
+    self.metrics["rot_dist"] = self.dist()
+    self.metrics["max_goal_angle"][:] = self.max_angle
+    if self.cfg.reverse_curriculum:
+      self.metrics["rc_steps"][:] = self.rc_steps
+      self.metrics["rc_rate"][:] = self._kind_rate[1]
+      self.metrics["scratch_rate"][:] = self._kind_rate[2]
+      self.metrics["followup_rate"][:] = self._kind_rate[0]
+
+  def _close_attempts(self, env_ids: torch.Tensor, hit: bool) -> None:
+    """Count the open goal attempts of ``env_ids`` as reached / failed, per kind."""
+    if len(env_ids) == 0:
+      return
+    kinds = self.kind[env_ids]  # kind 3 = already closed: not counted again
+    for k in range(3):
+      n = float((kinds == k).sum())
+      self._kind_att[k] += n
+      self._kind_hit[k] += n if hit else 0.0
+    self.kind[env_ids] = 3
+    # rates over windows of attempts; the expert-state rate drives rc_steps
+    for k in range(3):
+      if self._kind_att[k] >= self.cfg.rc_window:
+        self._kind_rate[k] = self._kind_hit[k] / self._kind_att[k]
+        if k == 1:
+          if self._kind_rate[1] > self.cfg.curriculum_up:
+            self.rc_steps = min(self.cfg.rc_max_steps, self.rc_steps * self.cfg.rc_factor)
+          elif self._kind_rate[1] < self.cfg.curriculum_down:
+            self.rc_steps = max(self.cfg.rc_init_steps, self.rc_steps / self.cfg.rc_factor)
+        self._kind_att[k] = self._kind_hit[k] = 0.0
+
+  def reset(self, env_ids):
+    if self.cfg.reverse_curriculum and env_ids is not None:
+      self._close_attempts(torch.as_tensor(env_ids, device=self.device), hit=False)  # episode ended first
+    self._in_reset = True
+    try:
+      return super().reset(env_ids)
+    finally:
+      self._in_reset = False
+
+  def _resample_command(self, env_ids: torch.Tensor) -> None:
+    n = len(env_ids)
+    if self.cfg.reverse_curriculum:
+      if self._in_reset:
+        # Episode start. Never read the cube pose here: kinematics are refreshed only after
+        # the reset block. Expert-state envs get the expert's goal, the rest a uniform one.
+        demo = getattr(self._env, "_rc_pending", None)
+        demo = demo[env_ids] if demo is not None else torch.zeros(n, dtype=torch.bool, device=self.device)
+        goal = random_quat(n, self.device)
+        if demo.any():
+          goal[demo] = self._env._rc_goal[env_ids[demo]]
+        self.goal[env_ids] = goal
+        self.kind[env_ids] = torch.where(demo, 1, 2)
+        return
+      self._close_attempts(env_ids, hit=False)  # timed out (reached goals were closed already)
+      self.kind[env_ids] = 0
+    if self.max_angle >= torch.pi - 1e-3:
+      self.goal[env_ids] = random_quat(n, self.device)
+      return
+    axis = torch.randn(n, 3, device=self.device)
+    axis = axis / axis.norm(dim=-1, keepdim=True)
+    lo = self.cfg.min_goal_angle
+    hi = max(self.max_angle, lo)
+    ang = lo + (hi - lo) * torch.rand(n, device=self.device)
+    self.goal[env_ids] = qmul(axis_angle_quat(axis, ang), self.cube.data.root_link_quat_w[env_ids])
+
+  def _update_command(self) -> None:
+    hit = (self.dist() < self.cfg.success_threshold).nonzero().flatten()
+    timed_out_mask = self.time_left <= self._env.step_dt
+    if self.cfg.reverse_curriculum:  # the angle curriculum sees follow-up goals only
+      self._attempts += float((self.kind[hit] == 0).sum()) + float((timed_out_mask & (self.kind == 0)).sum())
+      self._hits += float((self.kind[hit] == 0).sum())
+      self._close_attempts(hit, hit=True)
+    else:
+      self._attempts += len(hit) + timed_out_mask.sum().item()
+      self._hits += len(hit)
+    if self._attempts >= self.cfg.curriculum_window:
+      rate = self._hits / self._attempts
+      if rate > self.cfg.curriculum_up:
+        self.max_angle = min(torch.pi, self.max_angle + self.cfg.curriculum_step)
+      elif rate < self.cfg.curriculum_down:
+        self.max_angle = max(self.cfg.init_max_angle, self.max_angle - self.cfg.curriculum_step)
+      self._attempts = self._hits = 0.0
+    if len(hit):
+      self.metrics["successes"][hit] += 1
+      self._resample(hit)
+
+
+@dataclass(kw_only=True)
+class CubeGoalCommandCfg(CommandTermCfg):
+  entity_name: str = "cube"
+  success_threshold: float = 0.4
+  init_max_angle: float = 0.8  # set to pi for uniform SO(3) goals from the start (evaluation)
+  min_goal_angle: float = 0.5
+  curriculum_window: int = 2000  # goal attempts per curriculum decision
+  curriculum_up: float = 0.5
+  curriculum_down: float = 0.15
+  curriculum_step: float = 0.1
+  reverse_curriculum: bool = False
+  rc_init_steps: float = 10.0  # expert steps-to-goal of the easiest starts (0.5 s)
+  rc_max_steps: float = 400.0
+  rc_factor: float = 1.25  # rc_steps *= factor above curriculum_up, /= below curriculum_down
+  rc_window: int = 1000  # attempts of a kind per rate estimate / curriculum decision
+
+  def build(self, env) -> CubeGoalCommand:
+    return CubeGoalCommand(self, env)

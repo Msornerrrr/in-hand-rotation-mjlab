@@ -1,4 +1,5 @@
 from mjlab.envs.mdp import *  # noqa: F401, F403
+from in_hand_rotation_mjlab.mdp import *  # noqa: F401, F403
 
 from .commands import *  # noqa: F401, F403
 from .curriculums import *  # noqa: F401, F403
